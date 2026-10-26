@@ -119,13 +119,16 @@ export class Limiter {
   snapshot() {
     const now = Date.now();
     this._prune(now);
+    const used = this.slots.filter((x) => x <= now && x > now - this.windowMs).length;
     return {
       limit: this.limit,
       windowSecs: this.windowMs / 1000,
-      used: this.slots.filter((x) => x <= now && x > now - this.windowMs).length,
+      used,
+      available: this.limit - used,
       queued: this.slots.filter((x) => x > now).length,
       nextSlotInMs: Math.max(0, this._nextTime(now) - now),
       cooldownMs: Math.max(0, this.cooldownUntil - now),
+      utilizationPct: Math.round((used / this.limit) * 100),
     };
   }
 }
@@ -250,8 +253,12 @@ export function startProxy(opts = {}) {
       for (let attempt = 0; ; attempt++) {
         attempts = attempt + 1;
         if (counted) {
+          const snapBefore = limiter.snapshot();
           const acq = await limiter.acquire(ac.signal);
           waited += acq.waitedMs;
+          if (acq.waitedMs > 0) {
+            log(`${tag} waited ${acq.waitedMs}ms for slot | window: ${snapBefore.used}/${snapBefore.limit} (${snapBefore.utilizationPct}%) | avail: ${snapBefore.available} | queued: ${snapBefore.queued}`);
+          }
           if (cfg.staggerMs > 0) {
             await sleep(cfg.staggerMs, ac.signal);
             waited += cfg.staggerMs;
@@ -267,12 +274,17 @@ export function startProxy(opts = {}) {
           up.resume(); // drain and discard the 429 body
           limiter.cooldown(ms);
           stats.retried429++;
-          log(`${tag} upstream 429 → cooldown ${Math.round(ms / 1000)}s${ra == null ? " (no Retry-After)" : ""}, retry ${attempt + 1}/${cfg.maxRetries}`);
+          const snap429 = limiter.snapshot();
+          log(`${tag} upstream 429 → cooldown ${Math.round(ms / 1000)}s${ra == null ? " (no Retry-After)" : ""}, retry ${attempt + 1}/${cfg.maxRetries} | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
           continue;
         }
         if (up.statusCode === 429) {
           stats.passed429++;
-          if (counted) limiter.cooldown(parseRetryAfterMs(up.headers) ?? cfg.retryBaseMs);
+          if (counted) {
+            const snap429 = limiter.snapshot();
+            limiter.cooldown(parseRetryAfterMs(up.headers) ?? cfg.retryBaseMs);
+            log(`${tag} 429 after ${cfg.maxRetries} retries — passing through | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
+          }
         }
 
         const h = {};
@@ -284,7 +296,8 @@ export function startProxy(opts = {}) {
         res.on("close", () => up.destroy());
         up.on("error", () => res.destroy());
         up.pipe(res);
-        log(`${tag} ${up.statusCode} wait=${waited}ms${counted && cfg.staggerMs > 0 ? ` stagger=${cfg.staggerMs}ms` : ""} attempts=${attempts} ttfb=${Date.now() - t0 - waited}ms`);
+        const snap = limiter.snapshot();
+        log(`${tag} ${up.statusCode} wait=${waited}ms${counted && cfg.staggerMs > 0 ? ` stagger=${cfg.staggerMs}ms` : ""} attempts=${attempts} ttfb=${Date.now() - t0 - waited}ms | window: ${snap.used}/${snap.limit} (${snap.utilizationPct}%) | avail: ${snap.available} | queued: ${snap.queued}`);
         return;
       }
     } catch (e) {
@@ -315,7 +328,16 @@ export function startProxy(opts = {}) {
     server.listen(cfg.port, cfg.host, () => {
       const port = server.address().port;
       log(`rpm-proxy listening on http://${cfg.host}:${port} → ${base} (limit ${cfg.limit}/${cfg.windowSecs}s, retries ${cfg.maxRetries})`);
-      resolve({ server, limiter, stats, port, close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(() => r()); }) });
+
+      // Periodic status logging every 10 seconds
+      const statusInterval = setInterval(() => {
+        const snap = limiter.snapshot();
+        const rate = stats.requests / ((Date.now() - stats.startedAt) / 1000 / 60);
+        log(`[STATUS] window: ${snap.used}/${snap.limit} (${snap.utilizationPct}%) | available: ${snap.available} | queued: ${snap.queued} | cooldown: ${Math.round(snap.cooldownMs / 1000)}s | next slot: ${Math.round(snap.nextSlotInMs / 1000)}s | inflight: ${stats.inflight} | total req/min: ${rate.toFixed(1)} | retried 429: ${stats.retried429} | passed 429: ${stats.passed429} | aborted: ${stats.aborted} | errors: ${stats.errors}`);
+      }, 10_000);
+      statusInterval.unref();
+
+      resolve({ server, limiter, stats, port, close: () => new Promise((r) => { clearInterval(statusInterval); server.closeAllConnections?.(); server.close(() => r()); }) });
     }),
   );
 }
