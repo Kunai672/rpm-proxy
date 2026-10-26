@@ -30,6 +30,7 @@
  *   --host ADDR      (RPM_PROXY_HOST)     default 127.0.0.1  (use 0.0.0.0 for containers)
  *   --max-retries N  (RPM_PROXY_RETRIES)  default 5   (429 retries per request)
  *   --retry-base MS  (RPM_PROXY_RETRY_BASE) default 5000 (backoff when no Retry-After)
+ *   --stagger MS     (RPM_PROXY_STAGGER)  default 2000 (extra delay per POST after rate limit)
  *   --quiet                               suppress per-request log lines
  */
 
@@ -187,6 +188,7 @@ export function startProxy(opts = {}) {
     retryCapMs: 60_000,
     maxBodyBytes: 32 * 1024 * 1024,
     quiet: false,
+    staggerMs: 2000,
     ...opts,
   };
   const base = cfg.upstream.replace(/\/+$/, "");
@@ -247,7 +249,14 @@ export function startProxy(opts = {}) {
     try {
       for (let attempt = 0; ; attempt++) {
         attempts = attempt + 1;
-        if (counted) waited += (await limiter.acquire(ac.signal)).waitedMs;
+        if (counted) {
+          const acq = await limiter.acquire(ac.signal);
+          waited += acq.waitedMs;
+          if (cfg.staggerMs > 0) {
+            await sleep(cfg.staggerMs, ac.signal);
+            waited += cfg.staggerMs;
+          }
+        }
 
         const up = await forward(req.method, url, req.headers, body, ac.signal);
 
@@ -275,7 +284,7 @@ export function startProxy(opts = {}) {
         res.on("close", () => up.destroy());
         up.on("error", () => res.destroy());
         up.pipe(res);
-        log(`${tag} ${up.statusCode} wait=${waited}ms attempts=${attempts} ttfb=${Date.now() - t0 - waited}ms`);
+        log(`${tag} ${up.statusCode} wait=${waited}ms${counted && cfg.staggerMs > 0 ? ` stagger=${cfg.staggerMs}ms` : ""} attempts=${attempts} ttfb=${Date.now() - t0 - waited}ms`);
         return;
       }
     } catch (e) {
@@ -337,6 +346,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     host: a.host ?? e.RPM_PROXY_HOST ?? "127.0.0.1",
     maxRetries: num(a["max-retries"] ?? e.RPM_PROXY_RETRIES, 5),
     retryBaseMs: num(a["retry-base"] ?? e.RPM_PROXY_RETRY_BASE, 5000),
+    staggerMs: num(a.stagger ?? e.RPM_PROXY_STAGGER, 2000),
     quiet: !!a.quiet,
   });
   const stop = async () => {
