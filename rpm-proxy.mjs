@@ -246,15 +246,15 @@ export function startProxy(opts = {}) {
   // Human-readable timestamp: "Oct 28, 2026 10:00:00am"
   function formatTime(ts = Date.now()) {
     const d = new Date(ts);
-    return d.toLocaleString(undefined, {
-      month: "short",
-      day: "numeric",
-      year: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: true,
-    });
+    const month = d.toLocaleString(undefined, { month: "short" });
+    const day = d.getDate();
+    const year = d.getFullYear();
+    let hour = d.getHours();
+    const minute = String(d.getMinutes()).padStart(2, "0");
+    const second = String(d.getSeconds()).padStart(2, "0");
+    const ampm = hour >= 12 ? "pm" : "am";
+    hour = hour % 12 || 12;
+    return `${month} ${day}, ${year} ${hour}:${minute}:${second}${ampm}`;
   }
 
   // Extract model from request/response body
@@ -371,13 +371,60 @@ export function startProxy(opts = {}) {
         res.flushHeaders();
         res.on("close", () => up.destroy());
         up.on("error", () => res.destroy());
-        up.pipe(res);
+
         const snap = limiter.snapshot();
-        // Extract model from response (for non-streaming responses, we'd need to buffer - skip for streaming)
         const statusColor = up.statusCode >= 400 ? C.red : up.statusCode >= 300 ? C.yellow : C.green;
         const ttfb = Date.now() - t0 - waited;
-        const totalTime = Date.now() - t0;
-        log(`${statusColor}${up.statusCode}${C.reset} wait=${C.bold}${waited}ms${C.reset}${counted && cfg.staggerMs > 0 ? ` stagger=${cfg.staggerMs}ms` : ""} attempts=${attempts} ${C.blue}ttfb${C.reset}=${C.bold}${ttfb}ms${C.reset} ${C.blue}total${C.reset}=${C.bold}${totalTime}ms${C.reset} | window: ${snap.used}/${snap.limit} (${snap.utilizationPct}%) | avail: ${snap.available} | queued: ${snap.queued}`);
+        let resModel = null;
+        let responseChunks = [];
+        let responseEnded = false;
+
+        // Extract model from response body (non-streaming: buffer; streaming: first chunk)
+        const contentType = up.headers["content-type"] || "";
+        const isStreaming = contentType.includes("text/event-stream");
+
+        const modelExtractor = (chunk) => {
+          if (resModel) return;
+          try {
+            const text = chunk.toString();
+            if (isStreaming) {
+              // SSE format: data: {...}\n\n
+              for (const line of text.split("\n")) {
+                const trimmed = line.trim();
+                if (trimmed.startsWith("data: ")) {
+                  const data = trimmed.slice(6).trim();
+                  if (data === "[DONE]") continue;
+                  const parsed = JSON.parse(data);
+                  if (parsed.model) { resModel = parsed.model; break; }
+                }
+              }
+            } else {
+              responseChunks.push(chunk);
+            }
+          } catch {}
+        };
+
+        up.on("data", modelExtractor);
+
+        const logResponse = () => {
+          if (responseEnded) return;
+          responseEnded = true;
+          const totalTime = Date.now() - t0;
+          if (!isStreaming && !resModel) {
+            try {
+              const fullBody = Buffer.concat(responseChunks).toString();
+              const parsed = JSON.parse(fullBody);
+              resModel = parsed.model ?? null;
+            } catch {}
+          }
+          const modelStr = resModel ? ` ${C.magenta}model=${resModel}${C.reset}` : "";
+          log(`${statusColor}${up.statusCode}${C.reset} wait=${C.bold}${waited}ms${C.reset}${counted && cfg.staggerMs > 0 ? ` stagger=${cfg.staggerMs}ms` : ""} attempts=${attempts} ${C.blue}ttfb${C.reset}=${C.bold}${ttfb}ms${C.reset} ${C.blue}total${C.reset}=${C.bold}${totalTime}ms${C.reset}${modelStr} | window: ${snap.used}/${snap.limit} (${snap.utilizationPct}%) | avail: ${snap.available} | queued: ${snap.queued}`);
+        };
+
+        up.on("end", logResponse);
+        res.on("finish", logResponse);
+
+        up.pipe(res);
         return;
       }
     } catch (e) {
