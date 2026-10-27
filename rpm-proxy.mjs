@@ -30,7 +30,7 @@
  *   --host ADDR      (RPM_PROXY_HOST)     default 127.0.0.1  (use 0.0.0.0 for containers)
  *   --max-retries N  (RPM_PROXY_RETRIES)  default 5   (429 retries per request)
  *   --retry-base MS  (RPM_PROXY_RETRY_BASE) default 5000 (backoff when no Retry-After)
- *   --stagger MS     (RPM_PROXY_STAGGER)  default 2000 (extra delay per POST after rate limit)
+ *   --stagger MS     (RPM_PROXY_STAGGER)  default 5000 (extra delay per POST after rate limit)
  *   --quiet                               suppress per-request log lines
  */
 
@@ -61,12 +61,14 @@ function abortError() {
 }
 
 export class Limiter {
-  constructor({ limit, windowMs, padMs }) {
+  constructor({ limit, windowMs, padMs, staggerMs }) {
     this.limit = limit;
     this.windowMs = windowMs;
     this.padMs = padMs;
+    this.staggerMs = staggerMs;
     this.slots = []; // sorted send times (ms), including future reservations
     this.cooldownUntil = 0;
+    this.sequentialGate = Promise.resolve(); // mutex for sequential request processing
   }
 
   _prune(now) {
@@ -110,6 +112,31 @@ export class Limiter {
       }
       return { waitedMs: Date.now() - started };
     }
+  }
+
+  /**
+   * Acquire the sequential gate for counted requests.
+   * Ensures only one counted request is in-flight at a time, with stagger delay between.
+   */
+  async acquireSequential(signal) {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    
+    // Wait for previous request to complete + stagger
+    await this.sequentialGate;
+    
+    // Set up the next gate - the next request waits for this one to release
+    this.sequentialGate = gate;
+    
+    // Return a release function that the caller must call when done
+    // It will trigger the stagger delay then release the next waiter
+    return () => {
+      if (this.staggerMs > 0) {
+        sleep(this.staggerMs, signal).then(release).catch(release);
+      } else {
+        release();
+      }
+    };
   }
 
   cooldown(ms) {
@@ -191,7 +218,7 @@ export function startProxy(opts = {}) {
     retryCapMs: 60_000,
     maxBodyBytes: 32 * 1024 * 1024,
     quiet: false,
-    staggerMs: 2000,
+    staggerMs: 5000,
     ...opts,
   };
   const base = cfg.upstream.replace(/\/+$/, "");
@@ -329,15 +356,7 @@ export function startProxy(opts = {}) {
       const port = server.address().port;
       log(`rpm-proxy listening on http://${cfg.host}:${port} → ${base} (limit ${cfg.limit}/${cfg.windowSecs}s, retries ${cfg.maxRetries})`);
 
-      // Periodic status logging every 10 seconds
-      const statusInterval = setInterval(() => {
-        const snap = limiter.snapshot();
-        const rate = stats.requests / ((Date.now() - stats.startedAt) / 1000 / 60);
-        log(`[STATUS] window: ${snap.used}/${snap.limit} (${snap.utilizationPct}%) | available: ${snap.available} | queued: ${snap.queued} | cooldown: ${Math.round(snap.cooldownMs / 1000)}s | next slot: ${Math.round(snap.nextSlotInMs / 1000)}s | inflight: ${stats.inflight} | total req/min: ${rate.toFixed(1)} | retried 429: ${stats.retried429} | passed 429: ${stats.passed429} | aborted: ${stats.aborted} | errors: ${stats.errors}`);
-      }, 10_000);
-      statusInterval.unref();
-
-      resolve({ server, limiter, stats, port, close: () => new Promise((r) => { clearInterval(statusInterval); server.closeAllConnections?.(); server.close(() => r()); }) });
+      resolve({ server, limiter, stats, port, close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(() => r()); }) });
     }),
   );
 }
@@ -368,7 +387,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     host: a.host ?? e.RPM_PROXY_HOST ?? "127.0.0.1",
     maxRetries: num(a["max-retries"] ?? e.RPM_PROXY_RETRIES, 5),
     retryBaseMs: num(a["retry-base"] ?? e.RPM_PROXY_RETRY_BASE, 5000),
-    staggerMs: num(a.stagger ?? e.RPM_PROXY_STAGGER, 2000),
+    staggerMs: num(a.stagger ?? e.RPM_PROXY_STAGGER, 5000),
     quiet: !!a.quiet,
   });
   const stop = async () => {
