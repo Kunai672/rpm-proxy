@@ -333,7 +333,7 @@ export function startProxy(opts = {}) {
           const acq = await limiter.acquire(ac.signal);
           waited += acq.waitedMs;
           if (acq.waitedMs > 0) {
-            log(`${C.yellow}wait${C.reset}=${C.bold}${acq.waitedMs}ms${C.reset} for slot | window: ${snapBefore.used}/${snapBefore.limit} (${snapBefore.utilizationPct}%) | avail: ${snapBefore.available} | queued: ${snapBefore.queued}`);
+            log(`${C.cyan}${tag}${C.reset} ${C.yellow}wait${C.reset}=${C.bold}${acq.waitedMs}ms${C.reset} for slot | window: ${snapBefore.used}/${snapBefore.limit} (${snapBefore.utilizationPct}%) | avail: ${snapBefore.available} | queued: ${snapBefore.queued}`);
           }
           if (cfg.staggerMs > 0) {
             await sleep(cfg.staggerMs, ac.signal);
@@ -351,7 +351,7 @@ export function startProxy(opts = {}) {
           limiter.cooldown(ms);
           stats.retried429++;
           const snap429 = limiter.snapshot();
-          log(`${C.red}429${C.reset} → cooldown ${C.bold}${Math.round(ms / 1000)}s${C.reset}${ra == null ? ` ${C.gray}(no Retry-After)${C.reset}` : ""}, retry ${attempt + 1}/${cfg.maxRetries} | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
+          log(`${C.cyan}${tag}${C.reset} ${C.red}429${C.reset} → cooldown ${C.bold}${Math.round(ms / 1000)}s${C.reset}${ra == null ? ` ${C.gray}(no Retry-After)${C.reset}` : ""}, retry ${attempt + 1}/${cfg.maxRetries} | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
           continue;
         }
         if (up.statusCode === 429) {
@@ -359,7 +359,7 @@ export function startProxy(opts = {}) {
           if (counted) {
             const snap429 = limiter.snapshot();
             limiter.cooldown(parseRetryAfterMs(up.headers) ?? cfg.retryBaseMs);
-            log(`${C.red}429${C.reset} after ${cfg.maxRetries} retries — passing through | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
+            log(`${C.cyan}${tag}${C.reset} ${C.red}429${C.reset} after ${cfg.maxRetries} retries — passing through | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
           }
         }
 
@@ -418,7 +418,7 @@ export function startProxy(opts = {}) {
             } catch {}
           }
           const modelStr = resModel ? ` ${C.magenta}model=${resModel}${C.reset}` : "";
-          log(`${statusColor}${up.statusCode}${C.reset} wait=${C.bold}${waited}ms${C.reset}${counted && cfg.staggerMs > 0 ? ` stagger=${cfg.staggerMs}ms` : ""} attempts=${attempts} ${C.blue}ttfb${C.reset}=${C.bold}${ttfb}ms${C.reset} ${C.blue}total${C.reset}=${C.bold}${totalTime}ms${C.reset}${modelStr} | window: ${snap.used}/${snap.limit} (${snap.utilizationPct}%) | avail: ${snap.available} | queued: ${snap.queued}`);
+          log(`${C.cyan}${tag}${C.reset} ${statusColor}${up.statusCode}${C.reset} wait=${C.bold}${waited}ms${C.reset}${counted && cfg.staggerMs > 0 ? ` stagger=${cfg.staggerMs}ms` : ""} attempts=${attempts} ${C.blue}ttfb${C.reset}=${C.bold}${ttfb}ms${C.reset} ${C.blue}total${C.reset}=${C.bold}${totalTime}ms${C.reset}${modelStr} | window: ${snap.used}/${snap.limit} (${snap.utilizationPct}%) | avail: ${snap.available} | queued: ${snap.queued}`);
         };
 
         up.on("end", logResponse);
@@ -430,11 +430,11 @@ export function startProxy(opts = {}) {
     } catch (e) {
       if (e?.name === "AbortError" || ac.signal.aborted) {
         stats.aborted++;
-        log(`${C.gray}client gone${C.reset} after ${Date.now() - t0}ms (wait=${waited}ms) — released`);
+        log(`${C.cyan}${tag}${C.reset} ${C.gray}client gone${C.reset} after ${Date.now() - t0}ms (wait=${waited}ms) — released`);
         return;
       }
       stats.errors++;
-      log(`${C.red}error${C.reset}: ${e?.code ?? e?.message}`);
+      log(`${C.cyan}${tag}${C.reset} ${C.red}error${C.reset}: ${e?.code ?? e?.message}`);
       sendJson(res, 502, { error: { message: `rpm-proxy: upstream error (${e?.code ?? e?.message})`, type: "rpm_proxy_upstream" } });
     } finally {
       stats.inflight--;
