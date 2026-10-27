@@ -32,6 +32,7 @@
  *   --retry-base MS  (RPM_PROXY_RETRY_BASE) default 5000 (backoff when no Retry-After)
  *   --stagger MS     (RPM_PROXY_STAGGER)  default 5000 (extra delay per POST after rate limit)
  *   --quiet                               suppress per-request log lines
+ *   --color              (RPM_PROXY_COLOR)  force color output (auto: TTY)
  */
 
 import http from "node:http";
@@ -225,7 +226,49 @@ export function startProxy(opts = {}) {
   const limiter = new Limiter({ limit: cfg.limit, windowMs: cfg.windowSecs * 1000, padMs: cfg.padMs });
   const stats = { requests: 0, retried429: 0, passed429: 0, aborted: 0, errors: 0, inflight: 0, startedAt: Date.now() };
   const agents = { "https:": new https.Agent({ keepAlive: true }), "http:": new http.Agent({ keepAlive: true }) };
-  const log = (msg) => !cfg.quiet && console.log(`${new Date().toISOString()} ${msg}`);
+  // Color support detection
+  const useColor = cfg.color ?? (process.stdout.isTTY && !process.env.NO_COLOR);
+
+  // ANSI color codes
+  const C = {
+    reset: useColor ? "\x1b[0m" : "",
+    dim: useColor ? "\x1b[2m" : "",
+    bold: useColor ? "\x1b[1m" : "",
+    red: useColor ? "\x1b[31m" : "",
+    green: useColor ? "\x1b[32m" : "",
+    yellow: useColor ? "\x1b[33m" : "",
+    blue: useColor ? "\x1b[34m" : "",
+    magenta: useColor ? "\x1b[35m" : "",
+    cyan: useColor ? "\x1b[36m" : "",
+    gray: useColor ? "\x1b[90m" : "",
+  };
+
+  // Human-readable timestamp: "Oct 28, 2026 10:00:00am"
+  function formatTime(ts = Date.now()) {
+    const d = new Date(ts);
+    return d.toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true,
+    });
+  }
+
+  // Extract model from request/response body
+  function extractModel(body) {
+    if (!body || body.length === 0) return null;
+    try {
+      const parsed = JSON.parse(body.toString());
+      return parsed.model ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  const log = (msg) => !cfg.quiet && console.log(`${C.dim}${formatTime()}${C.reset} ${msg}`);
 
   function forward(method, pathAndQuery, headers, body, signal) {
     return new Promise((resolve, reject) => {
@@ -268,6 +311,9 @@ export function startProxy(opts = {}) {
       return; // client aborted mid-upload
     }
 
+    // Extract model from request body
+    const reqModel = extractModel(body);
+
     const t0 = Date.now();
     const counted = req.method === "POST";
     const tag = `${req.method} ${url.split("?")[0]}`;
@@ -275,6 +321,9 @@ export function startProxy(opts = {}) {
     stats.inflight++;
     let waited = 0;
     let attempts = 0;
+
+    // Log request received
+    log(`${C.cyan}${req.method}${C.reset} ${C.bold}${url.split("?")[0]}${C.reset}${reqModel ? ` ${C.magenta}model=${reqModel}${C.reset}` : ""}`);
 
     try {
       for (let attempt = 0; ; attempt++) {
@@ -284,7 +333,7 @@ export function startProxy(opts = {}) {
           const acq = await limiter.acquire(ac.signal);
           waited += acq.waitedMs;
           if (acq.waitedMs > 0) {
-            log(`${tag} waited ${acq.waitedMs}ms for slot | window: ${snapBefore.used}/${snapBefore.limit} (${snapBefore.utilizationPct}%) | avail: ${snapBefore.available} | queued: ${snapBefore.queued}`);
+            log(`${C.yellow}wait${C.reset}=${C.bold}${acq.waitedMs}ms${C.reset} for slot | window: ${snapBefore.used}/${snapBefore.limit} (${snapBefore.utilizationPct}%) | avail: ${snapBefore.available} | queued: ${snapBefore.queued}`);
           }
           if (cfg.staggerMs > 0) {
             await sleep(cfg.staggerMs, ac.signal);
@@ -302,7 +351,7 @@ export function startProxy(opts = {}) {
           limiter.cooldown(ms);
           stats.retried429++;
           const snap429 = limiter.snapshot();
-          log(`${tag} upstream 429 → cooldown ${Math.round(ms / 1000)}s${ra == null ? " (no Retry-After)" : ""}, retry ${attempt + 1}/${cfg.maxRetries} | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
+          log(`${C.red}429${C.reset} → cooldown ${C.bold}${Math.round(ms / 1000)}s${C.reset}${ra == null ? ` ${C.gray}(no Retry-After)${C.reset}` : ""}, retry ${attempt + 1}/${cfg.maxRetries} | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
           continue;
         }
         if (up.statusCode === 429) {
@@ -310,7 +359,7 @@ export function startProxy(opts = {}) {
           if (counted) {
             const snap429 = limiter.snapshot();
             limiter.cooldown(parseRetryAfterMs(up.headers) ?? cfg.retryBaseMs);
-            log(`${tag} 429 after ${cfg.maxRetries} retries — passing through | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
+            log(`${C.red}429${C.reset} after ${cfg.maxRetries} retries — passing through | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
           }
         }
 
@@ -324,17 +373,21 @@ export function startProxy(opts = {}) {
         up.on("error", () => res.destroy());
         up.pipe(res);
         const snap = limiter.snapshot();
-        log(`${tag} ${up.statusCode} wait=${waited}ms${counted && cfg.staggerMs > 0 ? ` stagger=${cfg.staggerMs}ms` : ""} attempts=${attempts} ttfb=${Date.now() - t0 - waited}ms | window: ${snap.used}/${snap.limit} (${snap.utilizationPct}%) | avail: ${snap.available} | queued: ${snap.queued}`);
+        // Extract model from response (for non-streaming responses, we'd need to buffer - skip for streaming)
+        const statusColor = up.statusCode >= 400 ? C.red : up.statusCode >= 300 ? C.yellow : C.green;
+        const ttfb = Date.now() - t0 - waited;
+        const totalTime = Date.now() - t0;
+        log(`${statusColor}${up.statusCode}${C.reset} wait=${C.bold}${waited}ms${C.reset}${counted && cfg.staggerMs > 0 ? ` stagger=${cfg.staggerMs}ms` : ""} attempts=${attempts} ${C.blue}ttfb${C.reset}=${C.bold}${ttfb}ms${C.reset} ${C.blue}total${C.reset}=${C.bold}${totalTime}ms${C.reset} | window: ${snap.used}/${snap.limit} (${snap.utilizationPct}%) | avail: ${snap.available} | queued: ${snap.queued}`);
         return;
       }
     } catch (e) {
       if (e?.name === "AbortError" || ac.signal.aborted) {
         stats.aborted++;
-        log(`${tag} client gone after ${Date.now() - t0}ms (wait=${waited}ms) — released`);
+        log(`${C.gray}client gone${C.reset} after ${Date.now() - t0}ms (wait=${waited}ms) — released`);
         return;
       }
       stats.errors++;
-      log(`${tag} upstream error: ${e?.code ?? e?.message}`);
+      log(`${C.red}error${C.reset}: ${e?.code ?? e?.message}`);
       sendJson(res, 502, { error: { message: `rpm-proxy: upstream error (${e?.code ?? e?.message})`, type: "rpm_proxy_upstream" } });
     } finally {
       stats.inflight--;
@@ -389,6 +442,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     retryBaseMs: num(a["retry-base"] ?? e.RPM_PROXY_RETRY_BASE, 5000),
     staggerMs: num(a.stagger ?? e.RPM_PROXY_STAGGER, 5000),
     quiet: !!a.quiet,
+    color: a.color === "false" ? false : a.color ?? (e.RPM_PROXY_COLOR === "false" ? false : e.RPM_PROXY_COLOR === "true" ? true : undefined),
   });
   const stop = async () => {
     await proxy.close();
