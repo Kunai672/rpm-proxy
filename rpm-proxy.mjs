@@ -243,15 +243,15 @@ export function startProxy(opts = {}) {
     gray: useColor ? "\x1b[90m" : "",
   };
 
-  // Human-readable timestamp: "Oct 28, 2026 10:00:00am"
+  // Human-readable timestamp in fixed UTC+8: "Oct 28, 2026 10:00:00am"
   function formatTime(ts = Date.now()) {
-    const d = new Date(ts);
-    const month = d.toLocaleString(undefined, { month: "short" });
-    const day = d.getDate();
-    const year = d.getFullYear();
-    let hour = d.getHours();
-    const minute = String(d.getMinutes()).padStart(2, "0");
-    const second = String(d.getSeconds()).padStart(2, "0");
+    const d = new Date(ts + 8 * 60 * 60 * 1000);
+    const month = d.toLocaleString("en-US", { month: "short", timeZone: "UTC" });
+    const day = d.getUTCDate();
+    const year = d.getUTCFullYear();
+    let hour = d.getUTCHours();
+    const minute = String(d.getUTCMinutes()).padStart(2, "0");
+    const second = String(d.getUTCSeconds()).padStart(2, "0");
     const ampm = hour >= 12 ? "pm" : "am";
     hour = hour % 12 || 12;
     return `${month} ${day}, ${year} ${hour}:${minute}:${second}${ampm}`;
