@@ -10,7 +10,9 @@
  *   # then in pi, set the provider's baseUrl to http://127.0.0.1:8787/v1
  *
  * Behavior
- *   - POST requests wait for a slot (sliding window, FIFO, bursts up to --limit).
+ *   - POST requests wait for a FIFO sliding-window slot and enter the request pool.
+ *   - Counted upstream requests are dispatched one at a time. The next POST starts
+ *     only after the previous response completes plus the --stagger delay.
  *   - Other methods (GET /v1/models …) pass through uncounted.
  *   - Upstream 429 → shared cooldown (Retry-After, else exponential backoff) and
  *     the request is transparently re-queued, up to --max-retries, so pi never
@@ -30,7 +32,7 @@
  *   --host ADDR      (RPM_PROXY_HOST)     default 127.0.0.1  (use 0.0.0.0 for containers)
  *   --max-retries N  (RPM_PROXY_RETRIES)  default 5   (429 retries per request)
  *   --retry-base MS  (RPM_PROXY_RETRY_BASE) default 5000 (backoff when no Retry-After)
- *   --stagger MS     (RPM_PROXY_STAGGER)  default 5000 (extra delay per POST after rate limit)
+ *   --stagger MS     (RPM_PROXY_STAGGER)  default 3000 (gap between counted upstream requests)
  *   --quiet                               suppress per-request log lines
  *   --color              (RPM_PROXY_COLOR)  force color output (auto: TTY)
  */
@@ -61,6 +63,76 @@ function abortError() {
   return e;
 }
 
+/**
+ * FIFO gate for counted upstream requests.
+ *
+ * A caller owns the gate until it releases it. Releasing waits for the stagger
+ * interval before the next queued caller is admitted, so upstream requests never
+ * overlap and are separated by at least the configured delay.
+ */
+class SequentialGate {
+  constructor(staggerMs) {
+    this.staggerMs = Number.isFinite(staggerMs) ? Math.max(0, staggerMs) : 0;
+    this.waiters = [];
+    this.active = false;
+    this.releaseTimer = null;
+  }
+
+  acquire(signal) {
+    if (signal?.aborted) return Promise.reject(abortError());
+    const started = Date.now();
+
+    return new Promise((resolve, reject) => {
+      const waiter = { started, resolve, reject, signal, onAbort: null };
+      waiter.onAbort = () => {
+        const index = this.waiters.indexOf(waiter);
+        if (index >= 0) this.waiters.splice(index, 1);
+        this._removeAbortListener(waiter);
+        reject(abortError());
+      };
+
+      signal?.addEventListener("abort", waiter.onAbort, { once: true });
+      this.waiters.push(waiter);
+      this._drain();
+    });
+  }
+
+  _removeAbortListener(waiter) {
+    if (waiter.signal && waiter.onAbort) {
+      waiter.signal.removeEventListener("abort", waiter.onAbort);
+    }
+  }
+
+  _drain() {
+    if (this.active || this.waiters.length === 0) return;
+
+    this.active = true;
+    const waiter = this.waiters.shift();
+    this._removeAbortListener(waiter);
+
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+
+      const open = () => {
+        this.releaseTimer = null;
+        this.active = false;
+        this._drain();
+      };
+
+      if (this.staggerMs > 0) {
+        this.releaseTimer = setTimeout(open, this.staggerMs);
+        this.releaseTimer.unref?.();
+      } else {
+        open();
+      }
+    };
+
+    waiter.resolve({ waitedMs: Date.now() - waiter.started, release });
+  }
+}
+
 export class Limiter {
   constructor({ limit, windowMs, padMs, staggerMs }) {
     this.limit = limit;
@@ -69,7 +141,7 @@ export class Limiter {
     this.staggerMs = staggerMs;
     this.slots = []; // sorted send times (ms), including future reservations
     this.cooldownUntil = 0;
-    this.sequentialGate = Promise.resolve(); // mutex for sequential request processing
+    this.sequentialGate = new SequentialGate(staggerMs);
   }
 
   _prune(now) {
@@ -116,28 +188,11 @@ export class Limiter {
   }
 
   /**
-   * Acquire the sequential gate for counted requests.
-   * Ensures only one counted request is in-flight at a time, with stagger delay between.
+   * Acquire the sequential gate for a counted request.
+   * The returned release function must be called when the upstream attempt ends.
    */
   async acquireSequential(signal) {
-    let release;
-    const gate = new Promise((resolve) => { release = resolve; });
-    
-    // Wait for previous request to complete + stagger
-    await this.sequentialGate;
-    
-    // Set up the next gate - the next request waits for this one to release
-    this.sequentialGate = gate;
-    
-    // Return a release function that the caller must call when done
-    // It will trigger the stagger delay then release the next waiter
-    return () => {
-      if (this.staggerMs > 0) {
-        sleep(this.staggerMs, signal).then(release).catch(release);
-      } else {
-        release();
-      }
-    };
+    return this.sequentialGate.acquire(signal);
   }
 
   cooldown(ms) {
@@ -148,15 +203,21 @@ export class Limiter {
     const now = Date.now();
     this._prune(now);
     const used = this.slots.filter((x) => x <= now && x > now - this.windowMs).length;
+    const rateSlotQueued = this.slots.filter((x) => x > now).length;
+    const sequentialQueued = this.sequentialGate.waiters.length;
     return {
       limit: this.limit,
       windowSecs: this.windowMs / 1000,
       used,
       available: this.limit - used,
-      queued: this.slots.filter((x) => x > now).length,
+      queued: rateSlotQueued + sequentialQueued,
+      rateSlotQueued,
+      sequentialQueued,
       nextSlotInMs: Math.max(0, this._nextTime(now) - now),
       cooldownMs: Math.max(0, this.cooldownUntil - now),
       utilizationPct: Math.round((used / this.limit) * 100),
+      staggerMs: this.sequentialGate.staggerMs,
+      maxConcurrentUpstream: 1,
     };
   }
 }
@@ -219,11 +280,11 @@ export function startProxy(opts = {}) {
     retryCapMs: 60_000,
     maxBodyBytes: 32 * 1024 * 1024,
     quiet: false,
-    staggerMs: 5000,
+    staggerMs: 3000,
     ...opts,
   };
   const base = cfg.upstream.replace(/\/+$/, "");
-  const limiter = new Limiter({ limit: cfg.limit, windowMs: cfg.windowSecs * 1000, padMs: cfg.padMs });
+  const limiter = new Limiter({ limit: cfg.limit, windowMs: cfg.windowSecs * 1000, padMs: cfg.padMs, staggerMs: cfg.staggerMs });
   const stats = { requests: 0, retried429: 0, passed429: 0, aborted: 0, errors: 0, inflight: 0, startedAt: Date.now() };
   const agents = { "https:": new https.Agent({ keepAlive: true }), "http:": new http.Agent({ keepAlive: true }) };
   // Color support detection
@@ -288,6 +349,24 @@ export function startProxy(opts = {}) {
     });
   }
 
+  function drainResponse(response) {
+    if (response.readableEnded || response.destroyed) return Promise.resolve();
+
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        resolve();
+      };
+      response.once("end", finish);
+      response.once("close", finish);
+      response.once("error", finish);
+      response.once("aborted", finish);
+      response.resume();
+    });
+  }
+
   async function handle(req, res) {
     const url = req.url ?? "/";
     if (url.startsWith("/__rpm/status")) {
@@ -321,6 +400,7 @@ export function startProxy(opts = {}) {
     stats.inflight++;
     let waited = 0;
     let attempts = 0;
+    let releaseSequential = null;
 
     // Log request received
     log(`${C.cyan}${req.method}${C.reset} ${C.bold}${url.split("?")[0]}${C.reset}${reqModel ? ` ${C.magenta}model=${reqModel}${C.reset}` : ""}`);
@@ -329,15 +409,22 @@ export function startProxy(opts = {}) {
       for (let attempt = 0; ; attempt++) {
         attempts = attempt + 1;
         if (counted) {
+          // Queue behind the previous counted request before reserving a rate slot.
+          // Holding the gate while acquiring the slot ensures a newly observed 429
+          // cooldown is respected by every request that has not fired yet.
+          const sequential = await limiter.acquireSequential(ac.signal);
+          releaseSequential = sequential.release;
+          waited += sequential.waitedMs;
+          if (sequential.waitedMs > 0) {
+            const snapGate = limiter.snapshot();
+            log(`${C.cyan}${tag}${C.reset} ${C.yellow}wait${C.reset}=${C.bold}${sequential.waitedMs}ms${C.reset} for sequential turn | window: ${snapGate.used}/${snapGate.limit} (${snapGate.utilizationPct}%) | avail: ${snapGate.available} | queued: ${snapGate.queued}`);
+          }
+
           const snapBefore = limiter.snapshot();
           const acq = await limiter.acquire(ac.signal);
           waited += acq.waitedMs;
           if (acq.waitedMs > 0) {
             log(`${C.cyan}${tag}${C.reset} ${C.yellow}wait${C.reset}=${C.bold}${acq.waitedMs}ms${C.reset} for slot | window: ${snapBefore.used}/${snapBefore.limit} (${snapBefore.utilizationPct}%) | avail: ${snapBefore.available} | queued: ${snapBefore.queued}`);
-          }
-          if (cfg.staggerMs > 0) {
-            await sleep(cfg.staggerMs, ac.signal);
-            waited += cfg.staggerMs;
           }
         }
 
@@ -347,11 +434,13 @@ export function startProxy(opts = {}) {
           const ra = parseRetryAfterMs(up.headers);
           const backoff = Math.min(cfg.retryCapMs, cfg.retryBaseMs * 2 ** attempt);
           const ms = ra ?? backoff;
-          up.resume(); // drain and discard the 429 body
           limiter.cooldown(ms);
           stats.retried429++;
           const snap429 = limiter.snapshot();
           log(`${C.cyan}${tag}${C.reset} ${C.red}429${C.reset} → cooldown ${C.bold}${Math.round(ms / 1000)}s${C.reset}${ra == null ? ` ${C.gray}(no Retry-After)${C.reset}` : ""}, retry ${attempt + 1}/${cfg.maxRetries} | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
+          await drainResponse(up);
+          releaseSequential?.();
+          releaseSequential = null;
           continue;
         }
         if (up.statusCode === 429) {
@@ -367,10 +456,26 @@ export function startProxy(opts = {}) {
         for (const [k, v] of Object.entries(up.headers)) if (!HOP.has(k.toLowerCase())) h[k] = v;
         h["x-rpm-proxy-wait-ms"] = String(waited);
         h["x-rpm-proxy-attempts"] = String(attempts);
-        res.writeHead(up.statusCode ?? 502, h);
-        res.flushHeaders();
+        try {
+          res.writeHead(up.statusCode ?? 502, h);
+          res.flushHeaders();
+        } catch (e) {
+          up.destroy();
+          throw e;
+        }
         res.on("close", () => up.destroy());
         up.on("error", () => res.destroy());
+
+        if (releaseSequential) {
+          const release = releaseSequential;
+          releaseSequential = null;
+          const releaseOnce = () => release();
+          up.once("end", releaseOnce);
+          up.once("close", releaseOnce);
+          up.once("error", releaseOnce);
+          up.once("aborted", releaseOnce);
+          if (up.readableEnded || up.destroyed) releaseOnce();
+        }
 
         const snap = limiter.snapshot();
         const statusColor = up.statusCode >= 400 ? C.red : up.statusCode >= 300 ? C.yellow : C.green;
@@ -437,6 +542,7 @@ export function startProxy(opts = {}) {
       log(`${C.cyan}${tag}${C.reset} ${C.red}error${C.reset}: ${e?.code ?? e?.message}`);
       sendJson(res, 502, { error: { message: `rpm-proxy: upstream error (${e?.code ?? e?.message})`, type: "rpm_proxy_upstream" } });
     } finally {
+      releaseSequential?.();
       stats.inflight--;
     }
   }
@@ -487,7 +593,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     host: a.host ?? e.RPM_PROXY_HOST ?? "127.0.0.1",
     maxRetries: num(a["max-retries"] ?? e.RPM_PROXY_RETRIES, 5),
     retryBaseMs: num(a["retry-base"] ?? e.RPM_PROXY_RETRY_BASE, 5000),
-    staggerMs: num(a.stagger ?? e.RPM_PROXY_STAGGER, 5000),
+    staggerMs: num(a.stagger ?? e.RPM_PROXY_STAGGER, 3000),
     quiet: !!a.quiet,
     color: a.color === "false" ? false : a.color ?? (e.RPM_PROXY_COLOR === "false" ? false : e.RPM_PROXY_COLOR === "true" ? true : undefined),
   });
