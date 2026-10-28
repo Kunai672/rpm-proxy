@@ -298,6 +298,8 @@ export function startProxy(opts = {}) {
     staggerMs: 3000,
     limit429DelayMs: 10000,
     timeoutDelayMs: 30000,
+    timeoutLimit: 3,
+    fallbackModel: "nvidia/nemotron-3-ultra-550b-a55b",
     ...opts,
   };
   const base = cfg.upstream.replace(/\/+$/, "");
@@ -430,6 +432,7 @@ export function startProxy(opts = {}) {
     let waited = 0;
     let attempts = 0;
     let releaseSequential = null;
+    let timeoutCount = 0;
 
     // Log request received
     log(`${C.cyan}REQUEST${C.reset} ${C.bold}${reqId}${C.reset} ${C.cyan}${req.method}${C.reset} ${C.bold}${url.split("?")[0]}${C.reset}${reqModel ? ` ${C.magenta}model=${reqModel}${C.reset}` : ""}`);
@@ -462,6 +465,16 @@ export function startProxy(opts = {}) {
           if (e?.name === "AbortError" || ac.signal.aborted) throw e;
           if (counted && (e?.code === "ETIMEDOUT" || e?.message?.includes("timeout"))) {
             stats.errors++;
+            timeoutCount++;
+            if (timeoutCount >= cfg.timeoutLimit) {
+              try {
+                const parsed = JSON.parse(body.toString());
+                parsed.model = cfg.fallbackModel;
+                body = Buffer.from(JSON.stringify(parsed));
+                reqModel = parsed.model;
+              } catch {}
+              log(`${C.cyan}${tag}${C.reset} ${C.yellow}switching model${C.reset} to ${C.magenta}${cfg.fallbackModel}${C.reset} after ${timeoutCount} timeouts`);
+            }
             const snapTo = limiter.snapshot();
             log(`${C.cyan}${tag}${C.reset} ${C.red}ETIMEDOUT${C.reset} → retrying (not exposed) after ${C.bold}${Math.round(cfg.timeoutDelayMs / 1000)}s${C.reset} | attempt ${attempt + 1} | window: ${snapTo.used}/${snapTo.limit} (${snapTo.utilizationPct}%) | avail: ${snapTo.available} | queued: ${snapTo.queued}`);
             releaseSequential?.();
@@ -642,6 +655,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     staggerMs: num(a.stagger ?? e.RPM_PROXY_STAGGER, 3000),
     limit429DelayMs: num(a["limit429-delay"] ?? e.RPM_PROXY_429_DELAY, 10000),
     timeoutDelayMs: num(a["timeout-delay"] ?? e.RPM_PROXY_TIMEOUT_DELAY, 30000),
+    timeoutLimit: num(a["timeout-limit"] ?? e.RPM_PROXY_TIMEOUT_LIMIT, 3),
+    fallbackModel: a["fallback-model"] ?? e.RPM_PROXY_FALLBACK_MODEL ?? "nvidia/nemotron-3-ultra-550b-a55b",
     quiet: !!a.quiet,
     color: a.color === "false" ? false : a.color ?? (e.RPM_PROXY_COLOR === "false" ? false : e.RPM_PROXY_COLOR === "true" ? true : undefined),
   });
