@@ -453,20 +453,20 @@ export function startProxy(opts = {}) {
         attempts = attempt + 1;
         if (counted) {
           // Pool/queue all counted requests and stagger send each one up to the limit
-          const sequential = await limiter.acquireSequential(ac.signal);
-          releaseSequential = sequential.release;
-          waited += sequential.waitedMs;
-          if (sequential.waitedMs > 0) {
-            const snapGate = limiter.snapshot();
-            log(`${C.orange}WAIT ${C.reset}${tag} wait${C.reset}=${C.bold}${sequential.waitedMs}ms${C.reset} for sequential turn | window: ${snapGate.used}/${snapGate.limit} (${snapGate.utilizationPct}%) | avail: ${snapGate.available} | queued: ${snapGate.queued}`);
-          }
+        const sequential = await limiter.acquireSequential(ac.signal);
+        releaseSequential = sequential.release;
+        waited += sequential.waitedMs;
+        if (sequential.waitedMs > 0) {
+          const snapGate = limiter.snapshot();
+          log(`${C.orange}WAIT ${C.reset}${tag} wait${C.reset}=${C.bold}${sequential.waitedMs}ms${C.reset} for sequential turn | window: ${snapGate.used}/${snapGate.limit} (${snapGate.utilizationPct}%) | avail: ${snapGate.available} | queued: ${snapGate.queued}`);
+        }
 
-          const acq = await limiter.acquire(ac.signal);
-          waited += acq.waitedMs;
-          if (acq.waitedMs > 0) {
-            const snapNow = limiter.snapshot();
-            log(`${C.orange}WAIT ${C.reset}${tag} wait${C.reset}=${C.bold}${acq.waitedMs}ms${C.reset} for slot | window: ${snapNow.used}/${snapNow.limit} (${snapNow.utilizationPct}%) | avail: ${snapNow.available} | queued: ${snapNow.queued}`);
-          }
+        const acq = await limiter.acquire(ac.signal);
+        waited += acq.waitedMs;
+        if (acq.waitedMs > 0) {
+          const snapNow = limiter.snapshot();
+          log(`${C.orange}WAIT ${C.reset}${tag} wait${C.reset}=${C.bold}${acq.waitedMs}ms${C.reset} for slot | window: ${snapNow.used}/${snapNow.limit} (${snapNow.utilizationPct}%) | avail: ${snapNow.available} | queued: ${snapNow.queued}`);
+        }
         }
 
         let up;
@@ -538,12 +538,7 @@ export function startProxy(opts = {}) {
         if (releaseSequential) {
           const release = releaseSequential;
           releaseSequential = null;
-          const releaseOnce = () => release();
-          up.once("end", releaseOnce);
-          up.once("close", releaseOnce);
-          up.once("error", releaseOnce);
-          up.once("aborted", releaseOnce);
-          if (up.readableEnded || up.destroyed) releaseOnce();
+          release();
         }
 
         const snap = limiter.snapshot();
