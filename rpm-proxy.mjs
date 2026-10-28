@@ -24,17 +24,19 @@
  *   - GET /__rpm/status → JSON for the pi footer; GET /__rpm/health → "ok".
  *
  * Flags (env in parentheses):
- *   --upstream URL   (RPM_PROXY_UPSTREAM) default https://integrate.api.nvidia.com
- *   --limit N        (RPM_PROXY_LIMIT)    default 8   (keep below the real quota)
- *   --window SECS    (RPM_PROXY_WINDOW)   default 60
- *   --pad MS         (RPM_PROXY_PAD)      default 250
- *   --port N         (RPM_PROXY_PORT)     default 8787
- *   --host ADDR      (RPM_PROXY_HOST)     default 127.0.0.1  (use 0.0.0.0 for containers)
- *   --max-retries N  (RPM_PROXY_RETRIES)  default 5   (429 retries per request)
- *   --retry-base MS  (RPM_PROXY_RETRY_BASE) default 5000 (backoff when no Retry-After)
- *   --stagger MS     (RPM_PROXY_STAGGER)  default 3000 (gap between counted upstream requests)
- *   --quiet                               suppress per-request log lines
- *   --color              (RPM_PROXY_COLOR)  force color output (auto: TTY)
+ *   --upstream URL      (RPM_PROXY_UPSTREAM)      default https://integrate.api.nvidia.com
+ *   --limit N           (RPM_PROXY_LIMIT)         default 8   (keep below the real quota)
+ *   --window SECS       (RPM_PROXY_WINDOW)        default 60
+ *   --pad MS            (RPM_PROXY_PAD)           default 250
+ *   --port N            (RPM_PROXY_PORT)         default 8787
+ *   --host ADDR         (RPM_PROXY_HOST)         default 127.0.0.1  (use 0.0.0.0 for containers)
+ *   --max-retries N     (RPM_PROXY_RETRIES)       default 5   (429 retries per request)
+ *   --retry-base MS     (RPM_PROXY_RETRY_BASE)    default 5000 (backoff when no Retry-After)
+ *   --stagger MS        (RPM_PROXY_STAGGER)       default 3000 (gap between counted upstream requests)
+ *   --limit429-delay MS (RPM_PROXY_429_DELAY)     default 10000 (delay all queued requests on 429)
+ *   --timeout-delay MS  (RPM_PROXY_TIMEOUT_DELAY) default 30000 (delay all queued requests on ETIMEDOUT)
+ *   --quiet                                      suppress per-request log lines
+ *   --color                 (RPM_PROXY_COLOR)     force color output (auto: TTY)
  */
 
 import http from "node:http";
@@ -134,13 +136,16 @@ class SequentialGate {
 }
 
 export class Limiter {
-  constructor({ limit, windowMs, padMs, staggerMs }) {
+  constructor({ limit, windowMs, padMs, staggerMs, limit429DelayMs = 10000, timeoutDelayMs = 30000 }) {
     this.limit = limit;
     this.windowMs = windowMs;
     this.padMs = padMs;
     this.staggerMs = staggerMs;
+    this.limit429DelayMs = limit429DelayMs;
+    this.timeoutDelayMs = timeoutDelayMs;
     this.slots = []; // sorted send times (ms), including future reservations
     this.cooldownUntil = 0;
+    this.globalDelayUntil = 0;
     this.sequentialGate = new SequentialGate(staggerMs);
   }
 
@@ -151,7 +156,7 @@ export class Limiter {
 
   _nextTime(now) {
     const s = this.slots;
-    let t = Math.max(now, this.cooldownUntil);
+    let t = Math.max(now, this.cooldownUntil, this.globalDelayUntil);
     if (s.length) t = Math.max(t, s[s.length - 1]); // FIFO
     if (s.length >= this.limit) t = Math.max(t, s[s.length - this.limit] + this.windowMs + this.padMs);
     return t;
@@ -178,7 +183,7 @@ export class Limiter {
           throw e;
         }
       }
-      if (this.cooldownUntil > Date.now()) {
+      if (this.cooldownUntil > Date.now() || this.globalDelayUntil > Date.now()) {
         // a 429 landed while we slept; our slot is stale → queue again behind it
         this._remove(t);
         continue;
@@ -199,6 +204,10 @@ export class Limiter {
     this.cooldownUntil = Math.max(this.cooldownUntil, Date.now() + ms);
   }
 
+  delayAll(ms) {
+    this.globalDelayUntil = Math.max(this.globalDelayUntil, Date.now() + ms);
+  }
+
   snapshot() {
     const now = Date.now();
     this._prune(now);
@@ -207,7 +216,8 @@ export class Limiter {
     const sequentialQueued = this.sequentialGate.waiters.length;
     const available = this.limit - used;
     const cooldownMs = Math.max(0, this.cooldownUntil - now);
-    const serializing = available <= 1 || cooldownMs > 0;
+    const globalDelayMs = Math.max(0, this.globalDelayUntil - now);
+    const serializing = available <= 1 || cooldownMs > 0 || globalDelayMs > 0;
     return {
       limit: this.limit,
       windowSecs: this.windowMs / 1000,
@@ -218,6 +228,7 @@ export class Limiter {
       sequentialQueued,
       nextSlotInMs: Math.max(0, this._nextTime(now) - now),
       cooldownMs,
+      globalDelayMs,
       utilizationPct: Math.round((used / this.limit) * 100),
       staggerMs: this.sequentialGate.staggerMs,
       serializing,
@@ -285,10 +296,12 @@ export function startProxy(opts = {}) {
     maxBodyBytes: 32 * 1024 * 1024,
     quiet: false,
     staggerMs: 3000,
+    limit429DelayMs: 10000,
+    timeoutDelayMs: 30000,
     ...opts,
   };
   const base = cfg.upstream.replace(/\/+$/, "");
-  const limiter = new Limiter({ limit: cfg.limit, windowMs: cfg.windowSecs * 1000, padMs: cfg.padMs, staggerMs: cfg.staggerMs });
+  const limiter = new Limiter({ limit: cfg.limit, windowMs: cfg.windowSecs * 1000, padMs: cfg.padMs, staggerMs: cfg.staggerMs, limit429DelayMs: cfg.limit429DelayMs, timeoutDelayMs: cfg.timeoutDelayMs });
   const stats = { requests: 0, retried429: 0, passed429: 0, aborted: 0, errors: 0, inflight: 0, startedAt: Date.now() };
   const agents = { "https:": new https.Agent({ keepAlive: true }), "http:": new http.Agent({ keepAlive: true }) };
   // Color support detection
@@ -344,7 +357,18 @@ export function startProxy(opts = {}) {
       if (body.length || method === "POST" || method === "PUT" || method === "PATCH") h["content-length"] = String(body.length);
       const lib = u.protocol === "https:" ? https : http;
       const r = lib.request(u, { method, headers: h, agent: agents[u.protocol] }, resolve);
-      r.on("error", reject);
+      r.on("error", (err) => {
+        if (err?.code === "ETIMEDOUT") {
+          reject(Object.assign(err, { code: "ETIMEDOUT" }));
+        } else {
+          reject(err);
+        }
+      });
+      r.setTimeout?.(120000, () => {
+        const err = new Error("timeout");
+        err.code = "ETIMEDOUT";
+        r.destroy(err);
+      });
       const onAbort = () => r.destroy(abortError());
       if (signal.aborted) return onAbort();
       signal.addEventListener("abort", onAbort, { once: true });
@@ -413,42 +437,49 @@ export function startProxy(opts = {}) {
       for (let attempt = 0; ; attempt++) {
         attempts = attempt + 1;
         if (counted) {
-          // Check if we need to serialize: only when at/near capacity (available <= 1)
-          // or when there's an active cooldown from a recent 429.
-          // This allows concurrent requests when there's plenty of RPM headroom.
-          const snapBefore = limiter.snapshot();
-          const shouldSerialize = snapBefore.available <= 1 || snapBefore.cooldownMs > 0;
-
-          if (shouldSerialize) {
-            // Queue behind the previous counted request before reserving a rate slot.
-            // Holding the gate while acquiring the slot ensures a newly observed 429
-            // cooldown is respected by every request that has not fired yet.
-            const sequential = await limiter.acquireSequential(ac.signal);
-            releaseSequential = sequential.release;
-            waited += sequential.waitedMs;
-            if (sequential.waitedMs > 0) {
-              const snapGate = limiter.snapshot();
-              log(`${C.cyan}${tag}${C.reset} ${C.yellow}wait${C.reset}=${C.bold}${sequential.waitedMs}ms${C.reset} for sequential turn | window: ${snapGate.used}/${snapGate.limit} (${snapGate.utilizationPct}%) | avail: ${snapGate.available} | queued: ${snapGate.queued}`);
-            }
+          // Pool/queue all counted requests and stagger send each one up to the limit
+          const sequential = await limiter.acquireSequential(ac.signal);
+          releaseSequential = sequential.release;
+          waited += sequential.waitedMs;
+          if (sequential.waitedMs > 0) {
+            const snapGate = limiter.snapshot();
+            log(`${C.cyan}${tag}${C.reset} ${C.yellow}wait${C.reset}=${C.bold}${sequential.waitedMs}ms${C.reset} for sequential turn | window: ${snapGate.used}/${snapGate.limit} (${snapGate.utilizationPct}%) | avail: ${snapGate.available} | queued: ${snapGate.queued}`);
           }
 
           const acq = await limiter.acquire(ac.signal);
           waited += acq.waitedMs;
           if (acq.waitedMs > 0) {
-            log(`${C.cyan}${tag}${C.reset} ${C.yellow}wait${C.reset}=${C.bold}${acq.waitedMs}ms${C.reset} for slot | window: ${snapBefore.used}/${snapBefore.limit} (${snapBefore.utilizationPct}%) | avail: ${snapBefore.available} | queued: ${snapBefore.queued}`);
+            const snapNow = limiter.snapshot();
+            log(`${C.cyan}${tag}${C.reset} ${C.yellow}wait${C.reset}=${C.bold}${acq.waitedMs}ms${C.reset} for slot | window: ${snapNow.used}/${snapNow.limit} (${snapNow.utilizationPct}%) | avail: ${snapNow.available} | queued: ${snapNow.queued}`);
           }
         }
 
-        const up = await forward(req.method, url, req.headers, body, ac.signal);
+        let up;
+        try {
+          up = await forward(req.method, url, req.headers, body, ac.signal);
+        } catch (e) {
+          if (e?.name === "AbortError" || ac.signal.aborted) throw e;
+          if (counted && (e?.code === "ETIMEDOUT" || e?.message?.includes("timeout"))) {
+            limiter.delayAll(cfg.timeoutDelayMs);
+            stats.errors++;
+            log(`${C.cyan}${tag}${C.reset} ${C.red}ETIMEDOUT${C.reset} → delaying all queued by ${C.bold}${Math.round(cfg.timeoutDelayMs / 1000)}s${C.reset}, retrying (not exposed) | attempt ${attempt + 1}`);
+            releaseSequential?.();
+            releaseSequential = null;
+            await sleep(cfg.timeoutDelayMs, ac.signal);
+            continue;
+          }
+          throw e;
+        }
 
         if (counted && up.statusCode === 429 && attempt < cfg.maxRetries) {
           const ra = parseRetryAfterMs(up.headers);
           const backoff = Math.min(cfg.retryCapMs, cfg.retryBaseMs * 2 ** attempt);
           const ms = ra ?? backoff;
           limiter.cooldown(ms);
+          limiter.delayAll(cfg.limit429DelayMs);
           stats.retried429++;
           const snap429 = limiter.snapshot();
-          log(`${C.cyan}${tag}${C.reset} ${C.red}429${C.reset} → cooldown ${C.bold}${Math.round(ms / 1000)}s${C.reset}${ra == null ? ` ${C.gray}(no Retry-After)${C.reset}` : ""}, retry ${attempt + 1}/${cfg.maxRetries} | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
+          log(`${C.cyan}${tag}${C.reset} ${C.red}429${C.reset} → global delay ${C.bold}${Math.round(cfg.limit429DelayMs / 1000)}s${C.reset} + cooldown ${C.bold}${Math.round(ms / 1000)}s${C.reset}${ra == null ? ` ${C.gray}(no Retry-After)${C.reset}` : ""}, retry ${attempt + 1}/${cfg.maxRetries} | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
           await drainResponse(up);
           releaseSequential?.();
           releaseSequential = null;
@@ -459,7 +490,8 @@ export function startProxy(opts = {}) {
           if (counted) {
             const snap429 = limiter.snapshot();
             limiter.cooldown(parseRetryAfterMs(up.headers) ?? cfg.retryBaseMs);
-            log(`${C.cyan}${tag}${C.reset} ${C.red}429${C.reset} after ${cfg.maxRetries} retries — passing through | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
+            limiter.delayAll(cfg.limit429DelayMs);
+            log(`${C.cyan}${tag}${C.reset} ${C.red}429${C.reset} after ${cfg.maxRetries} retries — passing through, delaying all queued by ${C.bold}${Math.round(cfg.limit429DelayMs / 1000)}s${C.reset} | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
           }
         }
 
@@ -605,6 +637,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     maxRetries: num(a["max-retries"] ?? e.RPM_PROXY_RETRIES, 5),
     retryBaseMs: num(a["retry-base"] ?? e.RPM_PROXY_RETRY_BASE, 5000),
     staggerMs: num(a.stagger ?? e.RPM_PROXY_STAGGER, 3000),
+    limit429DelayMs: num(a["limit429-delay"] ?? e.RPM_PROXY_429_DELAY, 10000),
+    timeoutDelayMs: num(a["timeout-delay"] ?? e.RPM_PROXY_TIMEOUT_DELAY, 30000),
     quiet: !!a.quiet,
     color: a.color === "false" ? false : a.color ?? (e.RPM_PROXY_COLOR === "false" ? false : e.RPM_PROXY_COLOR === "true" ? true : undefined),
   });
