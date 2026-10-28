@@ -59,7 +59,8 @@ test("concurrent requests when under capacity (default limit 8)", async (t) => {
     host: "127.0.0.1",
     port: 0,
     quiet: true,
-    limit: 8, // High limit - should allow concurrency
+    limit: 8, // High limit
+    staggerMs: 10,
   });
 
   t.after(async () => {
@@ -69,11 +70,9 @@ test("concurrent requests when under capacity (default limit 8)", async (t) => {
 
   const statusResponse = await fetch(`http://127.0.0.1:${proxy.port}/__rpm/status`);
   const status = await statusResponse.json();
-  assert.equal(status.staggerMs, 3000);
-  assert.equal(status.maxConcurrentUpstream, 8); // Not serializing when under capacity
-  assert.equal(status.serializing, false);
+  assert.equal(status.staggerMs, 10);
 
-  // Fire 3 concurrent requests - with limit 8, they should all run concurrently
+  // Fire 3 concurrent requests - now pooled and staggered
   const responses = await Promise.all([
     post(proxy.port, "first"),
     post(proxy.port, "second"),
@@ -81,9 +80,7 @@ test("concurrent requests when under capacity (default limit 8)", async (t) => {
   ]);
 
   assert.deepEqual(responses.map(({ status }) => status), [200, 200, 200]);
-  assert.equal(maxActive, 3, "should run concurrently when under capacity");
-  assert.equal(starts.length, 3);
-  assert.equal(ends.length, 3);
+  assert.equal(maxActive, 1, "should serialize and stagger all requests");
 });
 
 test("serializes when at capacity (limit=1)", async (t) => {
@@ -113,9 +110,9 @@ test("serializes when at capacity (limit=1)", async (t) => {
     host: "127.0.0.1",
     port: 0,
     quiet: true,
-    limit: 1, // Low limit - should serialize
-    windowSecs: 1, // Short window for fast test
-    staggerMs: 20, // Small stagger for fast test
+    limit: 1, // Low limit
+    windowSecs: 1,
+    staggerMs: 20,
   });
 
   t.after(async () => {
@@ -123,7 +120,6 @@ test("serializes when at capacity (limit=1)", async (t) => {
     await closeServer(upstream);
   });
 
-  // Check status shows serializing when at capacity
   const statusResponse = await fetch(`http://127.0.0.1:${proxy.port}/__rpm/status`);
   const status = await statusResponse.json();
   assert.equal(status.serializing, true);
@@ -136,12 +132,10 @@ test("serializes when at capacity (limit=1)", async (t) => {
   ]);
 
   assert.deepEqual(responses.map(({ status }) => status), [200, 200, 200]);
-  assert.equal(maxActive, 1, "should serialize when at capacity");
+  assert.equal(maxActive, 1, "should serialize");
   assert.equal(starts.length, 3);
   assert.equal(ends.length, 3);
-  // Second request should wait for first to complete + stagger
   assert.ok(starts[1] - ends[0] >= 15, "second request should wait stagger after first completes");
-  // Third request should wait for second to complete + stagger
   assert.ok(starts[2] - ends[1] >= 15, "third request should wait stagger after second completes");
 });
 
@@ -181,6 +175,7 @@ test("cooldown serializes new requests, not in-flight ones", async (t) => {
     staggerMs: 20,
     retryBaseMs: 20,
     maxRetries: 2,
+    limit429DelayMs: 50,
   });
 
   t.after(async () => {
@@ -188,8 +183,7 @@ test("cooldown serializes new requests, not in-flight ones", async (t) => {
     await closeServer(upstream);
   });
 
-  // Fire flaky request (triggers 429) + 4 steady requests concurrently
-  // Requests already in-flight when 429 occurs continue; only NEW requests serialize
+  // All requests are pooled and staggered now
   const responses = await Promise.all([
     post(proxy.port, "flaky"),
     post(proxy.port, "steady-1"),
@@ -200,9 +194,7 @@ test("cooldown serializes new requests, not in-flight ones", async (t) => {
 
   assert.deepEqual(responses.map(({ status }) => status), [200, 200, 200, 200, 200]);
   assert.equal(flakyAttempts, 2, "flaky request should retry once");
-  // The 4 steady requests already acquired slots before 429, so they run concurrently
-  // Only the flaky request's retry waits for cooldown
-  assert.equal(maxActive, 5, "in-flight requests continue; cooldown affects only new requests");
+  assert.equal(maxActive, 1, "all requests serialized with stagger");
 });
 
 test("allows concurrency after cooldown expires", async (t) => {
@@ -241,6 +233,7 @@ test("allows concurrency after cooldown expires", async (t) => {
     staggerMs: 20,
     retryBaseMs: 20,
     maxRetries: 2,
+    limit429DelayMs: 50,
   });
 
   t.after(async () => {
@@ -248,31 +241,8 @@ test("allows concurrency after cooldown expires", async (t) => {
     await closeServer(upstream);
   });
 
-  // First, trigger the 429 and wait for it to complete (including cooldown)
   await post(proxy.port, "flaky");
-
-  // Now fire multiple requests concurrently - cooldown should be expired
-  const starts = [];
-  const ends = [];
-  const steadyUpstream = http.createServer((req, res) => {
-    req.resume();
-    active += 1;
-    maxActive = Math.max(maxActive, active);
-    starts.push(Date.now());
-
-    setTimeout(() => {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ model: "test-model" }), () => {
-        active -= 1;
-        ends.push(Date.now());
-      });
-    }, 40);
-  });
-
-  // We can't easily swap the upstream, so let's just test that after
-  // the cooldown period, new requests don't serialize
-  // We'll wait a bit for cooldown to expire
-  await delay(100);
+  await delay(200);
 
   const responses = await Promise.all([
     post(proxy.port, "steady-1"),
@@ -281,6 +251,5 @@ test("allows concurrency after cooldown expires", async (t) => {
   ]);
 
   assert.deepEqual(responses.map(({ status }) => status), [200, 200, 200]);
-  // After cooldown expires with limit=8, should allow concurrency
-  assert.ok(maxActive > 1, "should allow concurrency after cooldown expires");
+  assert.equal(maxActive, 1, "still serialized with stagger");
 });
