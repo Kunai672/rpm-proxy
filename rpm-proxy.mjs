@@ -6,7 +6,7 @@
  * process owns the request budget and sees every request, including ones the
  * pi extension can't (compaction, sub-agents, other tools, other machines).
  *
- *   node rpm-proxy.mjs --upstream https://integrate.api.nvidia.com --limit 30
+ *   node rpm-proxy.mjs --upstream https://integrate.api.nvidia.com --limit 8
  *   # then in pi, set the provider's baseUrl to http://127.0.0.1:8787/v1
  *
  * Behavior
@@ -23,7 +23,7 @@
  *
  * Flags (env in parentheses):
  *   --upstream URL   (RPM_PROXY_UPSTREAM) default https://integrate.api.nvidia.com
- *   --limit N        (RPM_PROXY_LIMIT)    default 30   (keep below the real quota)
+ *   --limit N        (RPM_PROXY_LIMIT)    default 8   (keep below the real quota)
  *   --window SECS    (RPM_PROXY_WINDOW)   default 60
  *   --pad MS         (RPM_PROXY_PAD)      default 250
  *   --port N         (RPM_PROXY_PORT)     default 8787
@@ -209,7 +209,7 @@ function sendJson(res, status, obj) {
 export function startProxy(opts = {}) {
   const cfg = {
     upstream: "https://integrate.api.nvidia.com",
-    limit: 30,
+    limit: 8,
     windowSecs: 60,
     padMs: 250,
     port: 8787,
@@ -480,7 +480,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const num = (v, d) => (v === undefined || v === true || Number.isNaN(Number(v)) ? d : Number(v));
   const proxy = await startProxy({
     upstream: a.upstream ?? e.RPM_PROXY_UPSTREAM ?? "https://integrate.api.nvidia.com",
-    limit: num(a.limit ?? e.RPM_PROXY_LIMIT, 30),
+    limit: num(a.limit ?? e.RPM_PROXY_LIMIT, 8),
     windowSecs: num(a.window ?? e.RPM_PROXY_WINDOW, 60),
     padMs: num(a.pad ?? e.RPM_PROXY_PAD, 250),
     port: num(a.port ?? e.RPM_PROXY_PORT, 8787),
