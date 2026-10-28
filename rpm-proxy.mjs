@@ -422,8 +422,9 @@ export function startProxy(opts = {}) {
     const reqModel = extractModel(body);
 
     const t0 = Date.now();
+    const reqId = crypto.randomUUID().slice(0,8);
     const counted = req.method === "POST";
-    const tag = `${req.method} ${url.split("?")[0]}`;
+    const tag = `${reqId} ${req.method} ${url.split("?")[0]}`;
     stats.requests++;
     stats.inflight++;
     let waited = 0;
@@ -431,7 +432,7 @@ export function startProxy(opts = {}) {
     let releaseSequential = null;
 
     // Log request received
-    log(`${C.cyan}${req.method}${C.reset} ${C.bold}${url.split("?")[0]}${C.reset}${reqModel ? ` ${C.magenta}model=${reqModel}${C.reset}` : ""}`);
+    log(`${C.cyan}REQUEST${C.reset} ${C.bold}${reqId}${C.reset} ${C.cyan}${req.method}${C.reset} ${C.bold}${url.split("?")[0]}${C.reset}${reqModel ? ` ${C.magenta}model=${reqModel}${C.reset}` : ""}`);
 
     try {
       for (let attempt = 0; ; attempt++) {
@@ -443,7 +444,7 @@ export function startProxy(opts = {}) {
           waited += sequential.waitedMs;
           if (sequential.waitedMs > 0) {
             const snapGate = limiter.snapshot();
-            log(`${C.cyan}${tag}${C.reset} ${C.yellow}wait${C.reset}=${C.bold}${sequential.waitedMs}ms${C.reset} for sequential turn | window: ${snapGate.used}/${snapGate.limit} (${snapGate.utilizationPct}%) | avail: ${snapGate.available} | queued: ${snapGate.queued}`);
+            log(`${C.cyan}WAIT ${tag}${C.reset} ${C.yellow}wait${C.reset}=${C.bold}${sequential.waitedMs}ms${C.reset} for sequential turn | window: ${snapGate.used}/${snapGate.limit} (${snapGate.utilizationPct}%) | avail: ${snapGate.available} | queued: ${snapGate.queued}`);
           }
 
           const acq = await limiter.acquire(ac.signal);
@@ -460,9 +461,9 @@ export function startProxy(opts = {}) {
         } catch (e) {
           if (e?.name === "AbortError" || ac.signal.aborted) throw e;
           if (counted && (e?.code === "ETIMEDOUT" || e?.message?.includes("timeout"))) {
-            limiter.delayAll(cfg.timeoutDelayMs);
             stats.errors++;
-            log(`${C.cyan}${tag}${C.reset} ${C.red}ETIMEDOUT${C.reset} → delaying all queued by ${C.bold}${Math.round(cfg.timeoutDelayMs / 1000)}s${C.reset}, retrying (not exposed) | attempt ${attempt + 1}`);
+            const snapTo = limiter.snapshot();
+            log(`${C.cyan}${tag}${C.reset} ${C.red}ETIMEDOUT${C.reset} → retrying (not exposed) after ${C.bold}${Math.round(cfg.timeoutDelayMs / 1000)}s${C.reset} | attempt ${attempt + 1} | window: ${snapTo.used}/${snapTo.limit} (${snapTo.utilizationPct}%) | avail: ${snapTo.available} | queued: ${snapTo.queued}`);
             releaseSequential?.();
             releaseSequential = null;
             await sleep(cfg.timeoutDelayMs, ac.signal);
@@ -566,7 +567,7 @@ export function startProxy(opts = {}) {
             } catch {}
           }
           const modelStr = resModel ? ` ${C.magenta}model=${resModel}${C.reset}` : "";
-          log(`${C.cyan}${tag}${C.reset} ${statusColor}${up.statusCode}${C.reset} wait=${C.bold}${waited}ms${C.reset}${counted && cfg.staggerMs > 0 ? ` stagger=${cfg.staggerMs}ms` : ""} attempts=${attempts} ${C.blue}ttfb${C.reset}=${C.bold}${ttfb}ms${C.reset} ${C.blue}total${C.reset}=${C.bold}${totalTime}ms${C.reset}${modelStr} | window: ${snap.used}/${snap.limit} (${snap.utilizationPct}%) | avail: ${snap.available} | queued: ${snap.queued}`);
+          log(`${C.cyan}RESPONSE${C.reset} ${C.bold}${reqId}${C.reset} ${statusColor}${up.statusCode}${C.reset} wait=${C.bold}${waited}ms${C.reset}${counted && cfg.staggerMs > 0 ? ` stagger=${cfg.staggerMs}ms` : ""} attempts=${attempts} ${C.blue}ttfb${C.reset}=${C.bold}${ttfb}ms${C.reset} ${C.blue}total${C.reset}=${C.bold}${totalTime}ms${C.reset}${modelStr} | window: ${snap.used}/${snap.limit} (${snap.utilizationPct}%) | avail: ${snap.available} | queued: ${snap.queued}`);
         };
 
         up.on("end", logResponse);
@@ -578,11 +579,13 @@ export function startProxy(opts = {}) {
     } catch (e) {
       if (e?.name === "AbortError" || ac.signal.aborted) {
         stats.aborted++;
-        log(`${C.cyan}${tag}${C.reset} ${C.gray}client gone${C.reset} after ${Date.now() - t0}ms (wait=${waited}ms) — released`);
+        const snapGone = limiter.snapshot();
+        log(`${C.cyan}${tag}${C.reset} ${C.gray}client gone${C.reset} after ${Date.now() - t0}ms (wait=${waited}ms) — released | window: ${snapGone.used}/${snapGone.limit} (${snapGone.utilizationPct}%) | avail: ${snapGone.available} | queued: ${snapGone.queued}`);
         return;
       }
       stats.errors++;
-      log(`${C.cyan}${tag}${C.reset} ${C.red}error${C.reset}: ${e?.code ?? e?.message}`);
+      const snapErr = limiter.snapshot();
+      log(`${C.cyan}${tag}${C.reset} ${C.red}error${C.reset}: ${e?.code ?? e?.message} | window: ${snapErr.used}/${snapErr.limit} (${snapErr.utilizationPct}%) | avail: ${snapErr.available} | queued: ${snapErr.queued}`);
       sendJson(res, 502, { error: { message: `rpm-proxy: upstream error (${e?.code ?? e?.message})`, type: "rpm_proxy_upstream" } });
     } finally {
       releaseSequential?.();
