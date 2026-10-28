@@ -205,19 +205,23 @@ export class Limiter {
     const used = this.slots.filter((x) => x <= now && x > now - this.windowMs).length;
     const rateSlotQueued = this.slots.filter((x) => x > now).length;
     const sequentialQueued = this.sequentialGate.waiters.length;
+    const available = this.limit - used;
+    const cooldownMs = Math.max(0, this.cooldownUntil - now);
+    const serializing = available <= 1 || cooldownMs > 0;
     return {
       limit: this.limit,
       windowSecs: this.windowMs / 1000,
       used,
-      available: this.limit - used,
+      available,
       queued: rateSlotQueued + sequentialQueued,
       rateSlotQueued,
       sequentialQueued,
       nextSlotInMs: Math.max(0, this._nextTime(now) - now),
-      cooldownMs: Math.max(0, this.cooldownUntil - now),
+      cooldownMs,
       utilizationPct: Math.round((used / this.limit) * 100),
       staggerMs: this.sequentialGate.staggerMs,
-      maxConcurrentUpstream: 1,
+      serializing,
+      maxConcurrentUpstream: serializing ? 1 : this.limit,
     };
   }
 }
@@ -409,18 +413,25 @@ export function startProxy(opts = {}) {
       for (let attempt = 0; ; attempt++) {
         attempts = attempt + 1;
         if (counted) {
-          // Queue behind the previous counted request before reserving a rate slot.
-          // Holding the gate while acquiring the slot ensures a newly observed 429
-          // cooldown is respected by every request that has not fired yet.
-          const sequential = await limiter.acquireSequential(ac.signal);
-          releaseSequential = sequential.release;
-          waited += sequential.waitedMs;
-          if (sequential.waitedMs > 0) {
-            const snapGate = limiter.snapshot();
-            log(`${C.cyan}${tag}${C.reset} ${C.yellow}wait${C.reset}=${C.bold}${sequential.waitedMs}ms${C.reset} for sequential turn | window: ${snapGate.used}/${snapGate.limit} (${snapGate.utilizationPct}%) | avail: ${snapGate.available} | queued: ${snapGate.queued}`);
+          // Check if we need to serialize: only when at/near capacity (available <= 1)
+          // or when there's an active cooldown from a recent 429.
+          // This allows concurrent requests when there's plenty of RPM headroom.
+          const snapBefore = limiter.snapshot();
+          const shouldSerialize = snapBefore.available <= 1 || snapBefore.cooldownMs > 0;
+
+          if (shouldSerialize) {
+            // Queue behind the previous counted request before reserving a rate slot.
+            // Holding the gate while acquiring the slot ensures a newly observed 429
+            // cooldown is respected by every request that has not fired yet.
+            const sequential = await limiter.acquireSequential(ac.signal);
+            releaseSequential = sequential.release;
+            waited += sequential.waitedMs;
+            if (sequential.waitedMs > 0) {
+              const snapGate = limiter.snapshot();
+              log(`${C.cyan}${tag}${C.reset} ${C.yellow}wait${C.reset}=${C.bold}${sequential.waitedMs}ms${C.reset} for sequential turn | window: ${snapGate.used}/${snapGate.limit} (${snapGate.utilizationPct}%) | avail: ${snapGate.available} | queued: ${snapGate.queued}`);
+            }
           }
 
-          const snapBefore = limiter.snapshot();
           const acq = await limiter.acquire(ac.signal);
           waited += acq.waitedMs;
           if (acq.waitedMs > 0) {

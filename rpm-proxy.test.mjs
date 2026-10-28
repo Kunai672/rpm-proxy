@@ -70,7 +70,8 @@ test("concurrent requests when under capacity (default limit 8)", async (t) => {
   const statusResponse = await fetch(`http://127.0.0.1:${proxy.port}/__rpm/status`);
   const status = await statusResponse.json();
   assert.equal(status.staggerMs, 3000);
-  assert.equal(status.maxConcurrentUpstream, 1);
+  assert.equal(status.maxConcurrentUpstream, 8); // Not serializing when under capacity
+  assert.equal(status.serializing, false);
 
   // Fire 3 concurrent requests - with limit 8, they should all run concurrently
   const responses = await Promise.all([
@@ -121,6 +122,12 @@ test("serializes when at capacity (limit=1)", async (t) => {
     await proxy.close();
     await closeServer(upstream);
   });
+
+  // Check status shows serializing when at capacity
+  const statusResponse = await fetch(`http://127.0.0.1:${proxy.port}/__rpm/status`);
+  const status = await statusResponse.json();
+  assert.equal(status.serializing, true);
+  assert.equal(status.maxConcurrentUpstream, 1);
 
   const responses = await Promise.all([
     post(proxy.port, "first"),
