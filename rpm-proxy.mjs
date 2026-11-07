@@ -26,6 +26,7 @@
  * Flags (env in parentheses):
  *   --upstream URL      (RPM_PROXY_UPSTREAM)      default https://integrate.api.nvidia.com
  *   --limit N           (RPM_PROXY_LIMIT)         default 8   (keep below the real quota)
+ *   --limit-headroom N  (RPM_PROXY_LIMIT_HEADROOM) default 2  (reserve slots under the real quota)
  *   --window SECS       (RPM_PROXY_WINDOW)        default 60
  *   --pad MS            (RPM_PROXY_PAD)           default 250
  *   --port N            (RPM_PROXY_PORT)         default 8787
@@ -35,6 +36,7 @@
  *   --stagger MS        (RPM_PROXY_STAGGER)       default 3000 (gap between counted upstream requests)
  *   --limit429-delay MS (RPM_PROXY_429_DELAY)     default 10000 (delay all queued requests on 429)
  *   --timeout-delay MS  (RPM_PROXY_TIMEOUT_DELAY) default 30000 (delay all queued requests on ETIMEDOUT)
+ *   --429-jitter MS     (RPM_PROXY_429_JITTER)    default 5000 (random extra wait 0..jitterMs on 429 cooldown)
  *   --quiet                                      suppress per-request log lines
  *   --color                 (RPM_PROXY_COLOR)     force color output (auto: TTY)
  */
@@ -136,13 +138,27 @@ class SequentialGate {
 }
 
 export class Limiter {
-  constructor({ limit, windowMs, padMs, staggerMs, limit429DelayMs = 10000, timeoutDelayMs = 30000 }) {
+  constructor({
+    limit,
+    windowMs,
+    padMs,
+    staggerMs,
+    limit429DelayMs = 10000,
+    timeoutDelayMs = 30000,
+    headroom = 0,
+    jitterMs = 5000,
+    rng = Math.random
+  }) {
     this.limit = limit;
+    this.headroom = Math.max(0, headroom);
+    this.effectiveLimit = Math.max(1, limit - this.headroom);
     this.windowMs = windowMs;
     this.padMs = padMs;
     this.staggerMs = staggerMs;
     this.limit429DelayMs = limit429DelayMs;
     this.timeoutDelayMs = timeoutDelayMs;
+    this.jitterMs = Math.max(0, jitterMs);
+    this.rng = rng;
     this.slots = []; // sorted send times (ms), including future reservations
     this.cooldownUntil = 0;
     this.globalDelayUntil = 0;
@@ -158,8 +174,12 @@ export class Limiter {
     const s = this.slots;
     let t = Math.max(now, this.cooldownUntil, this.globalDelayUntil);
     if (s.length) t = Math.max(t, s[s.length - 1]); // FIFO
-    if (s.length >= this.limit) t = Math.max(t, s[s.length - this.limit] + this.windowMs + this.padMs);
+    if (s.length >= this.effectiveLimit) t = Math.max(t, s[s.length - this.effectiveLimit] + this.windowMs + this.padMs);
     return t;
+  }
+
+  _jitter() {
+    return this.jitterMs > 0 ? this.rng() * this.jitterMs : 0;
   }
 
   _remove(t) {
@@ -175,16 +195,22 @@ export class Limiter {
       this._prune(now);
       const t = this._nextTime(now);
       this.slots.push(t);
-      if (t > now) {
+      const waitMs = t > now ? t - now : 0;
+      let extraJitter = 0;
+      if (waitMs > 0 && (this.cooldownUntil > now || this.globalDelayUntil > now)) {
+        extraJitter = this._jitter();
+      }
+      const totalWait = waitMs + extraJitter;
+      if (totalWait > 0) {
         try {
-          await sleep(t - now, signal);
+          await sleep(totalWait, signal);
         } catch (e) {
           this._remove(t);
           throw e;
         }
       }
       if (this.cooldownUntil > Date.now() || this.globalDelayUntil > Date.now()) {
-        // a 429 landed while we slept; our slot is stale → queue again behind it
+        // a 429 landed while we slept; our slot is stale -> queue again behind it
         this._remove(t);
         continue;
       }
@@ -214,12 +240,14 @@ export class Limiter {
     const used = this.slots.filter((x) => x <= now && x > now - this.windowMs).length;
     const rateSlotQueued = this.slots.filter((x) => x > now).length;
     const sequentialQueued = this.sequentialGate.waiters.length;
-    const available = this.limit - used;
+    const available = this.effectiveLimit - used;
     const cooldownMs = Math.max(0, this.cooldownUntil - now);
     const globalDelayMs = Math.max(0, this.globalDelayUntil - now);
     const serializing = available <= 1 || cooldownMs > 0 || globalDelayMs > 0;
     return {
       limit: this.limit,
+      effectiveLimit: this.effectiveLimit,
+      headroom: this.headroom,
       windowSecs: this.windowMs / 1000,
       used,
       available,
@@ -229,10 +257,10 @@ export class Limiter {
       nextSlotInMs: Math.max(0, this._nextTime(now) - now),
       cooldownMs,
       globalDelayMs,
-      utilizationPct: Math.round((used / this.limit) * 100),
+      utilizationPct: Math.round((used / this.effectiveLimit) * 100),
       staggerMs: this.sequentialGate.staggerMs,
       serializing,
-      maxConcurrentUpstream: serializing ? 1 : this.limit,
+      maxConcurrentUpstream: serializing ? 1 : this.effectiveLimit,
     };
   }
 }
@@ -301,10 +329,12 @@ export function startProxy(opts = {}) {
     timeoutLimit: 1,
     fallbackModel: "nvidia/nemotron-3-ultra-550b-a55b",
     fallbackRequests: 10,
+    headroom: 2,
+    jitterMs: 5000,
     ...opts,
   };
   const base = cfg.upstream.replace(/\/+$/, "");
-  const limiter = new Limiter({ limit: cfg.limit, windowMs: cfg.windowSecs * 1000, padMs: cfg.padMs, staggerMs: cfg.staggerMs, limit429DelayMs: cfg.limit429DelayMs, timeoutDelayMs: cfg.timeoutDelayMs });
+  const limiter = new Limiter({ limit: cfg.limit, windowMs: cfg.windowSecs * 1000, padMs: cfg.padMs, staggerMs: cfg.staggerMs, limit429DelayMs: cfg.limit429DelayMs, timeoutDelayMs: cfg.timeoutDelayMs, headroom: cfg.headroom, jitterMs: cfg.jitterMs });
   const stats = { requests: 0, retried429: 0, passed429: 0, aborted: 0, errors: 0, inflight: 0, startedAt: Date.now() };
   let fallbackRemaining = 0;
   const agents = { "https:": new https.Agent({ keepAlive: true, timeout: 0 }), "http:": new http.Agent({ keepAlive: true, timeout: 0 }) };
@@ -435,7 +465,7 @@ export function startProxy(opts = {}) {
       fallbackRemaining--;
     }
 
-    const t0 = Date.now();
+        const t0 = Date.now();
     const reqId = crypto.randomUUID().slice(0, 8);
     const counted = req.method === "POST";
     const tag = `${reqId} ${req.method} ${url.split("?")[0]}`;
@@ -444,29 +474,36 @@ export function startProxy(opts = {}) {
     let waited = 0;
     let attempts = 0;
     let releaseSequential = null;
+    let slotAcquired = false;
 
     // Log request received
     log(`${C.blue}REQUEST${C.reset} ${C.bold}${reqId}${C.reset} ${C.cyan}${req.method}${C.reset} ${C.bold}${url.split("?")[0]}${C.reset}${reqModel ? ` ${C.magenta}model=${reqModel}${C.reset}` : ""}`);
 
     try {
+      // For counted requests, acquire the window slot ONCE before the retry loop.
+      // The slot remains a send-time reservation pruned by the window as before.
+      // Retries only re-acquire the sequential gate, not a new window slot.
+      if (counted) {
+        const acq = await limiter.acquire(ac.signal);
+        waited += acq.waitedMs;
+        slotAcquired = true;
+        if (acq.waitedMs > 0) {
+          const snapNow = limiter.snapshot();
+          log(`${C.orange}WAIT ${C.reset}${tag} wait${C.reset}=${C.bold}${acq.waitedMs}ms${C.reset} for slot | window: ${snapNow.used}/${snapNow.effectiveLimit} (${snapNow.utilizationPct}%) | avail: ${snapNow.available} | queued: ${snapNow.queued}`);
+        }
+      }
+
       for (let attempt = 0; ; attempt++) {
         attempts = attempt + 1;
         if (counted) {
           // Pool/queue all counted requests and stagger send each one up to the limit
-        const sequential = await limiter.acquireSequential(ac.signal);
-        releaseSequential = sequential.release;
-        waited += sequential.waitedMs;
-        if (sequential.waitedMs > 0) {
-          const snapGate = limiter.snapshot();
-          log(`${C.orange}WAIT ${C.reset}${tag} wait${C.reset}=${C.bold}${sequential.waitedMs}ms${C.reset} for sequential turn | window: ${snapGate.used}/${snapGate.limit} (${snapGate.utilizationPct}%) | avail: ${snapGate.available} | queued: ${snapGate.queued}`);
-        }
-
-        const acq = await limiter.acquire(ac.signal);
-        waited += acq.waitedMs;
-        if (acq.waitedMs > 0) {
-          const snapNow = limiter.snapshot();
-          log(`${C.orange}WAIT ${C.reset}${tag} wait${C.reset}=${C.bold}${acq.waitedMs}ms${C.reset} for slot | window: ${snapNow.used}/${snapNow.limit} (${snapNow.utilizationPct}%) | avail: ${snapNow.available} | queued: ${snapNow.queued}`);
-        }
+          const sequential = await limiter.acquireSequential(ac.signal);
+          releaseSequential = sequential.release;
+          waited += sequential.waitedMs;
+          if (sequential.waitedMs > 0) {
+            const snapGate = limiter.snapshot();
+            log(`${C.orange}WAIT ${C.reset}${tag} wait${C.reset}=${C.bold}${sequential.waitedMs}ms${C.reset} for sequential turn | window: ${snapGate.used}/${snapGate.effectiveLimit} (${snapGate.utilizationPct}%) | avail: ${snapGate.available} | queued: ${snapGate.queued}`);
+          }
         }
 
         let up;
@@ -478,7 +515,7 @@ export function startProxy(opts = {}) {
             stats.errors++;
             timeoutCount++;
             const snapTo = limiter.snapshot();
-            log(`${C.cyan}TIMEOUT ${C.reset}${tag} ${C.red}ETIMEDOUT${C.reset} ${C.gray}(${e?.message ?? "no message"})${C.reset} → retrying (not exposed) after ${C.bold}${Math.round(cfg.timeoutDelayMs / 1000)}s${C.reset} | attempt ${attempt + 1} | window: ${snapTo.used}/${snapTo.limit} (${snapTo.utilizationPct}%) | avail: ${snapTo.available} | queued: ${snapTo.queued}`);
+            log(`${C.cyan}TIMEOUT ${C.reset}${tag} ${C.red}ETIMEDOUT${C.reset} ${C.gray}(${e?.message ?? "no message"})${C.reset} → retrying (not exposed) after ${C.bold}${Math.round(cfg.timeoutDelayMs / 1000)}s${C.reset} | attempt ${attempt + 1} | window: ${snapTo.used}/${snapTo.effectiveLimit} (${snapTo.utilizationPct}%) | avail: ${snapTo.available} | queued: ${snapTo.queued}`);
             if (timeoutCount >= cfg.timeoutLimit) {
               try {
                 const parsed = JSON.parse(body.toString());
@@ -505,7 +542,7 @@ export function startProxy(opts = {}) {
           limiter.delayAll(cfg.limit429DelayMs);
           stats.retried429++;
           const snap429 = limiter.snapshot();
-          log(`${C.red}LIMITED ${C.reset}${tag} ${C.red}429${C.reset} → global delay ${C.bold}${Math.round(cfg.limit429DelayMs / 1000)}s${C.reset} + cooldown ${C.bold}${Math.round(ms / 1000)}s${C.reset}${ra == null ? ` ${C.gray}(no Retry-After)${C.reset}` : ""}, retry ${attempt + 1}/${cfg.maxRetries} | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
+          log(`${C.red}LIMITED ${C.reset}${tag} ${C.red}429${C.reset} → global delay ${C.bold}${Math.round(cfg.limit429DelayMs / 1000)}s${C.reset} + cooldown ${C.bold}${Math.round(ms / 1000)}s${C.reset}${ra == null ? ` ${C.gray}(no Retry-After)${C.reset}` : ""}, retry ${attempt + 1}/${cfg.maxRetries} | window: ${snap429.used}/${snap429.effectiveLimit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
           await drainResponse(up);
           releaseSequential?.();
           releaseSequential = null;
@@ -517,7 +554,7 @@ export function startProxy(opts = {}) {
             const snap429 = limiter.snapshot();
             limiter.cooldown(parseRetryAfterMs(up.headers) ?? cfg.retryBaseMs);
             limiter.delayAll(cfg.limit429DelayMs);
-            log(`${C.red}LIMITED ${C.reset}${tag} ${C.red}429${C.reset} after ${cfg.maxRetries} retries — passing through, delaying all queued by ${C.bold}${Math.round(cfg.limit429DelayMs / 1000)}s${C.reset} | window: ${snap429.used}/${snap429.limit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
+            log(`${C.red}LIMITED ${C.reset}${tag} ${C.red}429${C.reset} after ${cfg.maxRetries} retries — passing through, delaying all queued by ${C.bold}${Math.round(cfg.limit429DelayMs / 1000)}s${C.reset} | window: ${snap429.used}/${snap429.effectiveLimit} (${snap429.utilizationPct}%) | avail: ${snap429.available} | queued: ${snap429.queued}`);
           }
         }
 
@@ -557,7 +594,9 @@ export function startProxy(opts = {}) {
           try {
             const text = chunk.toString();
             if (isStreaming) {
-              // SSE format: data: {...}\n\n
+              // SSE format: data: {...}
+
+
               for (const line of text.split("\n")) {
                 const trimmed = line.trim();
                 if (trimmed.startsWith("data: ")) {
@@ -587,7 +626,7 @@ export function startProxy(opts = {}) {
             } catch { }
           }
           const modelStr = resModel ? ` ${C.magenta}model=${resModel}${C.reset}` : "";
-          log(`${C.green}RESPONSE${C.reset} ${C.bold}${reqId}${C.reset} ${statusColor}${up.statusCode}${C.reset} wait=${C.bold}${waited}ms${C.reset}${counted && cfg.staggerMs > 0 ? ` stagger=${cfg.staggerMs}ms` : ""} attempts=${attempts} ${C.blue}ttfb${C.reset}=${C.bold}${ttfb / 1000}s${C.reset} ${C.blue}total${C.reset}=${C.bold}${totalTime / 1000}s${C.reset}${modelStr} | window: ${snap.used}/${snap.limit} (${snap.utilizationPct}%) | avail: ${snap.available} | queued: ${snap.queued}`);
+          log(`${C.green}RESPONSE${C.reset} ${C.bold}${reqId}${C.reset} ${statusColor}${up.statusCode}${C.reset} wait=${C.bold}${waited}ms${C.reset}${counted && cfg.staggerMs > 0 ? ` stagger=${cfg.staggerMs}ms` : ""} attempts=${attempts} ${C.blue}ttfb${C.reset}=${C.bold}${ttfb / 1000}s${C.reset} ${C.blue}total${C.reset}=${C.bold}${totalTime / 1000}s${C.reset}${modelStr} | window: ${snap.used}/${snap.effectiveLimit} (${snap.utilizationPct}%) | avail: ${snap.available} | queued: ${snap.queued}`);
         };
 
         up.on("end", logResponse);
@@ -600,20 +639,19 @@ export function startProxy(opts = {}) {
       if (e?.name === "AbortError" || ac.signal.aborted) {
         stats.aborted++;
         const snapGone = limiter.snapshot();
-        log(`${C.red}ABORTED ${C.reset}${tag} ${C.gray}client gone${C.reset} after ${Date.now() - t0}ms (wait=${waited}ms) — released | window: ${snapGone.used}/${snapGone.limit} (${snapGone.utilizationPct}%) | avail: ${snapGone.available} | queued: ${snapGone.queued}`);
+        log(`${C.red}ABORTED ${C.reset}${tag} ${C.gray}client gone${C.reset} after ${Date.now() - t0}ms (wait=${waited}ms) — released | window: ${snapGone.used}/${snapGone.effectiveLimit} (${snapGone.utilizationPct}%) | avail: ${snapGone.available} | queued: ${snapGone.queued}`);
         return;
       }
       stats.errors++;
       const snapErr = limiter.snapshot();
-      log(`${C.red}ERROR ${C.reset}${tag} ${C.red}error${C.reset}: ${e?.code ?? e?.message} | window: ${snapErr.used}/${snapErr.limit} (${snapErr.utilizationPct}%) | avail: ${snapErr.available} | queued: ${snapErr.queued}`);
+      log(`${C.red}ERROR ${C.reset}${tag} ${C.red}error${C.reset}: ${e?.code ?? e?.message} | window: ${snapErr.used}/${snapErr.effectiveLimit} (${snapErr.utilizationPct}%) | avail: ${snapErr.available} | queued: ${snapErr.queued}`);
       sendJson(res, 502, { error: { message: `rpm-proxy: upstream error (${e?.code ?? e?.message})`, type: "rpm_proxy_upstream" } });
     } finally {
       releaseSequential?.();
       stats.inflight--;
     }
-  }
-
-  const server = http.createServer((req, res) => {
+}
+const server = http.createServer((req, res) => {
     handle(req, res).catch((e) => {
       stats.errors++;
       log(`internal error: ${e?.message}`);
@@ -666,6 +704,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     timeoutLimit: num(a["timeout-limit"] ?? e.RPM_PROXY_TIMEOUT_LIMIT, 1),
     fallbackModel: a["fallback-model"] ?? e.RPM_PROXY_FALLBACK_MODEL ?? "nvidia/nemotron-3-ultra-550b-a55b",
     fallbackRequests: num(a["fallback-requests"] ?? e.RPM_PROXY_FALLBACK_REQUESTS, 10),
+    headroom: num(a["limit-headroom"] ?? e.RPM_PROXY_LIMIT_HEADROOM, 2),
+    jitterMs: num(a["429-jitter"] ?? e.RPM_PROXY_429_JITTER, 5000),
     quiet: !!a.quiet,
     color: a.color === "false" ? false : a.color ?? (e.RPM_PROXY_COLOR === "false" ? false : e.RPM_PROXY_COLOR === "true" ? true : undefined),
   });

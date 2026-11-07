@@ -48,6 +48,7 @@ Each option can be passed as a CLI flag **or** an environment variable.
 | `--host` | `RPM_PROXY_HOST` | `127.0.0.1` | Listen address (use `0.0.0.0` for containers/remote) |
 | `--upstream` | `RPM_PROXY_UPSTREAM` | `https://integrate.api.nvidia.com` | Where to forward requests |
 | `--limit` | `RPM_PROXY_LIMIT` | `8` | Max counted requests per window — keep below the real quota |
+| `--limit-headroom` | `RPM_PROXY_LIMIT_HEADROOM` | `2` | Reserve slots under the real quota (effective cap = max(1, limit - headroom)) |
 | `--window-secs` | `RPM_PROXY_WINDOW` | `60` | Sliding-window length (seconds) |
 | `--pad` | `RPM_PROXY_PAD` | `250` | Extra margin (ms) on each window |
 | `--stagger-ms` | `RPM_PROXY_STAGGER` | `3000` | Gap between counted upstream requests (ms) |
@@ -58,6 +59,7 @@ Each option can be passed as a CLI flag **or** an environment variable.
 | `--timeout-limit` | `RPM_PROXY_TIMEOUT_LIMIT` | `1` | Timeouts before switching to fallback model |
 | `--fallback-model` | `RPM_PROXY_FALLBACK_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b` | Model used on exhaustion/timeouts |
 | `--fallback-requests` | `RPM_PROXY_FALLBACK_REQUESTS` | `10` | Requests after fallback is triggered |
+| `--429-jitter` | `RPM_PROXY_429_JITTER` | `5000` | Random extra wait 0..jitterMs on 429 cooldown (ms) |
 | `--quiet` | — | off | Suppress per-request log lines |
 | `--color` | `RPM_PROXY_COLOR` | auto (TTY) | Force color on/off |
 
@@ -67,6 +69,7 @@ Example:
 node rpm-proxy.mjs \
   --upstream https://integrate.api.nvidia.com \
   --limit 8 \
+  --limit-headroom 2 \
   --fallback-model nvidia/nemotron-3-ultra-550b-a55b \
   --fallback-requests 10 \
   --quiet
@@ -77,10 +80,16 @@ node rpm-proxy.mjs \
 - **Counted requests (POST)** wait for a FIFO sliding-window slot, enter a pool,
   and are dispatched one at a time — the next POST starts only after the previous
   response completes **plus** the `--stagger-ms` delay.
-- **Other methods (GET /v1/models, etc.)** pass through uncalled-counted.
+- **Other methods (GET /v1/models, etc.)** pass through uncounted.
 - **Upstream 429** → shared cooldown (`Retry-After`, else exponential backoff) and
   the request is transparently re-queued, up to `--max-retries`, so pi never sees
   the 429. If retries run out, the last 429 is passed through.
+- **Retries reuse their window slot** — a request that is retried K times still
+  occupies exactly one window slot. Only the sequential gate is re-acquired on
+  retry; the rate-limit slot is acquired once before the first attempt.
+- **429 jitter** — when a cooldown or global delay is active, each waiting
+  request adds a random extra 0..`--429-jitter` ms to its wait, spreading the
+  post-cooldown burst instead of firing all queued requests at once.
 - **Client disconnects** (Esc, pi timeout, kill) cancel the queued reservation and
   abort the upstream request.
 - **Streaming (SSE)** is piped through unbuffered. The `Authorization` header is
@@ -132,7 +141,14 @@ kill %1                      # stop
 ## Notes
 
 - **Keep `--limit` below your real upstream quota** — the goal is to stay under it.
-  Set it too high and you'll still get 429s.
+  Set it too high and you'll still get 429s. Use `--limit-headroom` (default 2)
+  to reserve a safety margin; the effective cap becomes `max(1, limit - headroom)`.
+  This absorbs clock/window misalignment between proxy and upstream. Existing
+  behavior is unchanged when `headroom=0`.
+- **Why retries used to make it worse**: previously, each 429 retry called
+  `limiter.acquire()` again, consuming a fresh window slot. Retries themselves
+  pushed the window over and guaranteed the next attempt also 429'd. Now the
+  slot is acquired once per request; retries only re-acquire the sequential gate.
 - **For containers/remote hosts**, use `--host 0.0.0.0` and point your baseUrl at
   that machine's IP and port instead of `127.0.0.1`.
 - Log lines are prefixed with the request ID so you can follow a single request
